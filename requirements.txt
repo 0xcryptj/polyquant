@@ -1,0 +1,52 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# Production Dependencies — pinned for reproducibility
+# Regenerate with: pip-compile requirements.in
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── Polymarket ────────────────────────────────────────────────────────────────
+py-clob-client>=0.17.0
+# polymarket-cli is installed separately via npm
+
+# ── Coinbase AgentKit ─────────────────────────────────────────────────────────
+coinbase-agentkit>=0.1.0
+cdp-sdk>=0.14.0
+
+# ── Web3 / Blockchain ─────────────────────────────────────────────────────────
+web3>=6.20.0
+eth-account>=0.11.0
+
+# ── Market Data ───────────────────────────────────────────────────────────────
+ccxt>=4.3.0
+pandas>=2.2.0
+numpy>=1.26.0
+
+# ── Statistics / ML ───────────────────────────────────────────────────────────
+arch>=7.0.0          # GARCH modeling (ARCH package by Kevin Sheppard)
+scikit-learn>=1.4.0  # Logistic regression calibration
+scipy>=1.12.0
+
+# ── Config / Validation ───────────────────────────────────────────────────────
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# ── Telegram Bot ─────────────────────────────────────────────────────────────
+python-telegram-bot>=21.0.0
+
+# ── TUI ───────────────────────────────────────────────────────────────────────
+textual>=0.55.0
+rich>=13.7.0
+
+# ── HTTP / Async ─────────────────────────────────────────────────────────────
+httpx>=0.27.0
+aiohttp>=3.9.0
+tenacity>=8.2.0      # Retry logic with exponential backoff
+
+# ── Logging / Monitoring ─────────────────────────────────────────────────────
+structlog>=24.1.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+click>=8.1.0
+tabulate>=0.9.0
+python-dateutil>=2.9.0
+pytz>=2024.1

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PolyQuant Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="terminal-header">
+      <div class="logo">
+        <span class="logo-icon">◆</span>
+        <h1>PolyQuant</h1>
+        <span class="mode-badge" id="mode-badge">Paper</span>
+      </div>
+      <div class="header-stats" id="header-stats">
+        <div class="stat">
+          <span class="stat-label">Total Equity</span>
+          <span class="stat-value" id="stat-bankroll">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Total Profit</span>
+          <span class="stat-value profit" id="stat-profit">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Win Rate</span>
+          <span class="stat-value" id="stat-winrate">—</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="terminal-main">
+      <section class="panel bankroll-panel">
+        <div class="bankroll-row">
+          <h2>Bankroll & PnL</h2>
+          <div class="bankroll-grid">
+          <div class="card">
+            <span class="card-label">Available</span>
+            <span class="card-value" id="bankroll-available">—</span>
+          </div>
+          <div class="card">
+            <span class="card-label">In Positions</span>
+            <span class="card-value" id="bankroll-locked">—</span>
+          </div>
+          <div class="card">
+            <span class="card-label">Total Equity</span>
+            <span class="card-value" id="bankroll-total">—</span>
+          </div>
+          <div class="card">
+            <span class="card-label">Baseline</span>
+            <span class="card-value" id="bankroll-baseline">—</span>
+          </div>
+          <div class="card">
+            <span class="card-label">Profit (Since Reset)</span>
+            <span class="card-value profit" id="bankroll-profit">—</span>
+          </div>
+          <div class="card">
+            <span class="card-label">Return %</span>
+            <span class="card-value" id="bankroll-return">—</span>
+          </div>
+        </div>
+        <p class="markets-notice" id="markets-notice"></p>
+        <div class="charts-row">
+          <div class="chart-container chart-pnl">
+            <canvas id="pnl-chart"></canvas>
+          </div>
+          <div class="chart-container chart-btc">
+            <canvas id="btc-chart"></canvas>
+          </div>
+        </div>
+        <div class="trade-grid-panel">
+          <h3>Trade History <span class="grid-legend"><span class="legend-win">■</span> Win</span><span class="grid-legend"><span class="legend-loss">■</span> Loss</span></h3>
+          <div class="trade-grid" id="trade-grid"></div>
+        </div>
+      </section>
+
+      <section class="panel positions-panel">
+        <h2>Open Positions</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Dir</th>
+                <th>Type</th>
+                <th>Question</th>
+                <th>Shares</th>
+                <th>Size</th>
+                <th>Avg</th>
+                <th>To Win</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="positions-body">
+              <tr><td colspan="9" class="empty">No open positions</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel trades-panel">
+        <h2>Recent Trades</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Dir</th>
+                <th>Type</th>
+                <th>Question</th>
+                <th>Shares</th>
+                <th>Size</th>
+                <th>P&L</th>
+                <th>Avg</th>
+                <th>Exit</th>
+                <th>To Win</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="trades-body">
+              <tr><td colspan="11" class="empty">No trades yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="controls-panel">
+        <h2>Controls</h2>
+        <div class="control-group">
+          <label>Mode</label>
+          <div class="toggle-row">
+            <button class="toggle-btn active" data-mode="paper">Paper</button>
+            <button class="toggle-btn" data-mode="live">Live</button>
+          </div>
+          <p class="control-hint">Restart bot to apply</p>
+        </div>
+        <div class="control-group">
+          <label>Reset Bankroll</label>
+          <input type="number" id="reset-amount" value="1000" min="100" step="100">
+          <button class="btn btn-danger" id="btn-reset">Reset to $1000</button>
+        </div>
+        <div class="control-group">
+          <label>Wallet</label>
+          <div class="wallet-info" id="wallet-info">—</div>
+        </div>
+      </aside>
+    </main>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

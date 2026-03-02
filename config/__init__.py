@@ -1,3 +1,2 @@
-from config.settings import settings
-
-__all__ = ["settings"]
+# Settings are loaded lazily — import directly:
+#   from config.settings import settings

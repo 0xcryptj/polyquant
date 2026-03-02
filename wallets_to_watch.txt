@@ -1,0 +1,15 @@
+# ════════════════════════════════════════════════════════════════════════════
+# Polymarket Whale Wallet Watch List
+# Format: WALLET_ADDRESS | LABEL | NOTES
+# Blank lines and lines starting with # are ignored.
+#
+# To find wallets:
+#   1. Go to https://polymarket.com/leaderboard
+#   2. Click a top trader → copy their wallet from the URL
+#   3. Add entries below in the format: 0x... | LABEL | notes
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── Add real whale wallets below (examples shown — replace with real ones) ───
+# 0xYOUR_WHALE_ADDRESS_1 | Whale Alpha | High win rate on BTC markets
+# 0xYOUR_WHALE_ADDRESS_2 | Whale Beta  | Large conviction trades
+

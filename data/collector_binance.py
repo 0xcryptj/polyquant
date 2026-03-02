@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,14 +30,42 @@ RAW_DIR.mkdir(parents=True, exist_ok=True)
 REQUEST_PAUSE_MS = 300
 
 
-def _build_exchange() -> ccxt.binance:
-    return ccxt.binance(
-        {
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-            "urls": {"api": {"rest": settings.binance_base_url}},
-        }
-    )
+# Cache the working exchange across calls to avoid re-testing each time
+_exchange_cache: ccxt.Exchange | None = None
+
+
+def _build_exchange() -> ccxt.Exchange:
+    """
+    Build a ccxt exchange instance.
+
+    Priority:
+      1. Binance (global) — may be geo-blocked in some regions (451 error)
+      2. Kraken  — no geo-restrictions, BTC/USDT available
+    """
+    global _exchange_cache
+    if _exchange_cache is not None:
+        return _exchange_cache
+
+    try:
+        exch = ccxt.binance(
+            {
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+                "urls": {"api": {"rest": settings.binance_base_url}},
+            }
+        )
+        # Lightweight test: fetch a single candle — throws 451 if geo-blocked
+        exch.fetch_ohlcv("BTC/USDT", "1m", limit=1)
+        logger.info("Using Binance for OHLCV data")
+        _exchange_cache = exch
+        return exch
+    except Exception as exc:
+        logger.warning("Binance unavailable (%s) — using Kraken", exc)
+
+    kraken = ccxt.kraken({"enableRateLimit": True})
+    logger.info("Using Kraken for OHLCV data")
+    _exchange_cache = kraken
+    return kraken
 
 
 def fetch_ohlcv(
@@ -62,6 +90,10 @@ def fetch_ohlcv(
     symbol = symbol or settings.btc_symbol
     timeframe = timeframe or settings.candle_interval
     exchange = _build_exchange()
+
+    # Kraken uses BTC/USDT (same symbol, just need to load markets first)
+    if isinstance(exchange, ccxt.kraken):
+        exchange.load_markets()  # ensure market list is loaded
 
     since_ms: int | None = None
     if since_dt is not None:
@@ -106,7 +138,7 @@ def fetch_ohlcv_paginated(
 
     now = datetime.now(timezone.utc)
     if since_dt is None:
-        since_dt = datetime(now.year, now.month, now.day - 30, tzinfo=timezone.utc)
+        since_dt = now - timedelta(days=30)
     if until_dt is None:
         until_dt = now
 

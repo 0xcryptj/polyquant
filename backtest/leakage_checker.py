@@ -219,4 +219,4 @@ def check_scaler_fit_on_train_only(
             )
         return LeakageCheckResult(name=name, passed=True, details="Scaler appears fit on train only")
     except Exception as exc:
-        return LeakageCheckResult(name=name, passed=True, details=f"Could not verify (non-critical): {exc}")
+        return LeakageCheckResult(name=name, passed=False, details=f"Could not verify: {exc}")

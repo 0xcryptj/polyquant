@@ -76,19 +76,29 @@ logs/
 # ── Data ─────────────────────────────────────────────────────────────────────
 data/raw/
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 *.parquet
 *.feather
 
+# ── Web GUI override ─────────────────────────────────────────────────────────
+config/mode_override.json
+
 # ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
 .DS_Store
 Thumbs.db
+
+# ── Runtime state ─────────────────────────────────────────────────────────────
+*.pid
+paper_trading/bot.pid
 
 # ── Node (polymarket-cli) ─────────────────────────────────────────────────────
 node_modules/

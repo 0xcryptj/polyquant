@@ -1,0 +1,149 @@
+[
+  {
+    "token_id": "46866868857194367945413771860582064655745092128562966218540356888709464260149",
+    "question": "Will Bitcoin hit $150k by March 31, 2026?",
+    "end_date": "2026-04-01T04:00:00Z",
+    "condition_id": "0xe857d6cd180acdb314dd38e583e625172407fa83d54156c78679e601b312d068",
+    "liquidity": 26894.54364,
+    "days_until_end": 30.066550210601854,
+    "source": "gamma_events",
+    "market_type": "price",
+    "event_title": "When will Bitcoin hit $150k?"
+  },
+  {
+    "token_id": "105267568073659068217311993901927962476298440625043565106676088842803600775810",
+    "question": "Will bitcoin hit $1m before GTA VI?",
+    "end_date": "2026-07-31T12:00:00Z",
+    "condition_id": "0xbb57ccf5853a85487bc3d83d04d669310d28c6c810758953b9d9b91d1aee89d2",
+    "liquidity": 656719.1796,
+    "days_until_end": 151.39988354393518,
+    "source": "gamma",
+    "market_type": "price"
+  },
+  {
+    "token_id": "110251828161543119357013227499774714771527179764174739487025581227481937033858",
+    "question": "MicroStrategy sells any Bitcoin by June 30, 2026?",
+    "end_date": "2026-07-01T04:00:00Z",
+    "condition_id": "0x8e7a03cb1970e2ad6533b01892403516b6b3f5b5fa90ed7d104c28b27e40ba00",
+    "liquidity": 107820.1224,
+    "days_until_end": 121.06655021060185,
+    "source": "gamma_events",
+    "market_type": "event",
+    "event_title": "MicroStrategy sells any Bitcoin by ___ ?"
+  },
+  {
+    "token_id": "108547978327958467449318042977006580876058560639743186491243488736783119648127",
+    "question": "MicroStrategy sells any Bitcoin by March 31, 2026?",
+    "end_date": "",
+    "condition_id": "0x9a4db724246b51cbfbc8000dbbd6b54d72b057767c3690e63d940b26d78c6cb0",
+    "liquidity": 92986.25368,
+    "days_until_end": null,
+    "source": "gamma_events",
+    "market_type": "event",
+    "event_title": "MicroStrategy sells any Bitcoin by ___ ?"
+  },
+  {
+    "token_id": "93694900555669388759405753550770573998169287228984912881955464376232163096213",
+    "question": "Will Bitcoin hit $150k by December 31, 2026?",
+    "end_date": "2027-01-01T04:00:00Z",
+    "condition_id": "0x02deb9538f5c123373adaa4ee6217b01745f1662bc902e46ac92f3fe6f8741e8",
+    "liquidity": 34321.5063,
+    "days_until_end": 305.06655021060186,
+    "source": "gamma_events",
+    "market_type": "price",
+    "event_title": "When will Bitcoin hit $150k?"
+  },
+  {
+    "token_id": "13915689317269078219168496739008737517740566192006337297676041270492637394586",
+    "question": "Will Bitcoin hit $150k by June 30, 2026?",
+    "end_date": "2026-07-01T04:00:00Z",
+    "condition_id": "0xa0f4c4924ea1a8b410b4ce821c2a9955fad21a1b19bdcfde90816732278b3dd5",
+    "liquidity": 23906.67656,
+    "days_until_end": 121.06655021060185,
+    "source": "gamma_events",
+    "market_type": "price",
+    "event_title": "When will Bitcoin hit $150k?"
+  },
+  {
+    "token_id": "111128191581505463501777127559667396812474366956707382672202929745167742497287",
+    "question": "MicroStrategy sells any Bitcoin by December 31, 2026?",
+    "end_date": "2026-07-01T04:00:00Z",
+    "condition_id": "0x8213d395e079614d6c4d7f4cbb9be9337ab51648a21cc2a334ae8f1966d164b4",
+    "liquidity": 14183.0915,
+    "days_until_end": 121.06655021060185,
+    "source": "gamma_events",
+    "market_type": "event",
+    "event_title": "MicroStrategy sells any Bitcoin by ___ ?"
+  },
+  {
+    "token_id": "85050326633307103921116183405959204984545408066775745936128241765963012426383",
+    "question": "Will El Salvador hold $1b+ of BTC by December 31, 2026?",
+    "end_date": "2027-01-01T05:00:00Z",
+    "condition_id": "0x59cbdc98e569c31d3c33517131aa57a0a8d28e412df4a567d7df5b3ae9ec3de8",
+    "liquidity": 96.7138,
+    "days_until_end": 305.1082168772685,
+    "source": "gamma_events",
+    "market_type": "event",
+    "event_title": "Will El Salvador hold $1b+ of BTC by...? "
+  },
+  {
+    "question": "Will the Iranian regime fall by March 31?",
+    "token_id": "48825140812430902098404528620382945035793471220915259967486864813738884055220",
+    "market_type": "macro",
+    "end_date": "2026-03-31T00:00:00Z",
+    "yes_price": 0.226,
+    "vol24h": 2707561.2212530044,
+    "vol_total": 13210407.233537,
+    "tradeable": true
+  },
+  {
+    "question": "Will Iran close the Strait of Hormuz by March 31?",
+    "token_id": "11259214629259962188961658360673801608680858594287954976598964541495296876564",
+    "market_type": "macro",
+    "end_date": "2026-12-31T00:00:00Z",
+    "yes_price": 0.415,
+    "vol24h": 1546774.1962739993,
+    "vol_total": 3349221.902298,
+    "tradeable": true
+  },
+  {
+    "question": "Will the Iranian regime fall by June 30?",
+    "token_id": "38397507750621893057346880033441136112987238933685677349709401910643842844855",
+    "market_type": "macro",
+    "end_date": "2026-06-30T00:00:00Z",
+    "yes_price": 0.405,
+    "vol24h": 1094802.5364140018,
+    "vol_total": 4228166.21283,
+    "tradeable": true
+  },
+  {
+    "question": "US x Iran ceasefire by March 6?",
+    "token_id": "45384651537373960665605066318330086764816901476264060880498387434805925753491",
+    "market_type": "macro",
+    "end_date": "",
+    "yes_price": 0.105,
+    "vol24h": 805004.615603999,
+    "vol_total": 1071362.070349,
+    "tradeable": true
+  },
+  {
+    "question": "Will US or Israel strike Iran first?",
+    "token_id": "8067407495040644813204108294851401001772374258077273118510788800804436836793",
+    "market_type": "macro",
+    "end_date": "2026-03-31T00:00:00Z",
+    "yes_price": 0.4885,
+    "vol24h": 775287.317663,
+    "vol_total": 2621279.130121,
+    "tradeable": true
+  },
+  {
+    "question": "Will Alexandria Ocasio-Cortez win the 2028 US Presidential Election?",
+    "token_id": "8113830512143065501177519557124858581375945005490796772950589720955457782465",
+    "market_type": "macro",
+    "end_date": "2028-11-07T00:00:00Z",
+    "yes_price": 0.0595,
+    "vol24h": 764080.8380509986,
+    "vol_total": 6558220.750128,
+    "tradeable": true
+  }
+]

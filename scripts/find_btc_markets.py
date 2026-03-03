@@ -31,13 +31,11 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-GAMMA_API   = "https://gamma-api.polymarket.com"
-CLOB_API    = "https://clob.polymarket.com"
 OUTPUT_PATH = PROJECT_ROOT / "config" / "btc_markets.json"
 
 # Keywords for matching Bitcoin / crypto price markets
 BTC_KEYWORDS = ["btc", "bitcoin"]
-TIME_KEYWORDS_5M = ["5-minute", "5 minute", "5min", "next 5"]
+TIME_KEYWORDS_5M = ["5-minute", "5 minute", "5min", "next 5", "up/down", "updown", "5m"]
 PRICE_KEYWORDS = [
     "above", "below", "higher", "lower", "reach", "hit",
     "price", "end", "close", "over", "under",
@@ -124,18 +122,21 @@ def _slug_for_5m_market(market: dict) -> str | None:
 
 def _gamma_search(client: httpx.Client, limit: int = 200) -> list[dict]:
     """Search Gamma API for active BTC events and extract market metadata."""
+    from config.settings import settings
+    gamma_api = settings.polymarket_gamma_host.rstrip("/")
     found: list[dict] = []
     seen_conditions: set[str] = set()
 
     search_terms = [
         "Bitcoin", "BTC price", "BTC above", "bitcoin hit",
-        "BTC 5", "bitcoin 5-minute", "crypto price",
+        "BTC 5", "bitcoin 5-minute", "btc updown", "btc up down",
+        "crypto price", "5m",
     ]
 
     for term in search_terms:
         try:
             resp = client.get(
-                f"{GAMMA_API}/markets",
+                f"{gamma_api}/markets",
                 params={"active": "true", "closed": "false", "limit": 200, "keyword": term},
             )
             resp.raise_for_status()
@@ -226,6 +227,8 @@ def _clob_search(client: httpx.Client) -> list[dict]:
     Search CLOB API for active BTC/crypto markets with real order books.
     Iterates through pages until BTC markets are found.
     """
+    from config.settings import settings
+    clob_api = settings.polymarket_clob_host.rstrip("/")
     found: list[dict] = []
     seen: set[str] = set()
     cursor = ""
@@ -234,7 +237,7 @@ def _clob_search(client: httpx.Client) -> list[dict]:
     while pages_checked < 20:
         try:
             resp = client.get(
-                f"{CLOB_API}/markets",
+                f"{clob_api}/markets",
                 params={"next_cursor": cursor, "limit": 500},
             )
             resp.raise_for_status()
@@ -291,14 +294,75 @@ def _clob_search(client: httpx.Client) -> list[dict]:
     return found
 
 
-def _gamma_events_search(client: httpx.Client) -> list[dict]:
-    """Search Gamma events endpoint for BTC/crypto events with embedded markets."""
+def _gamma_events_search_5m(client: httpx.Client) -> list[dict]:
+    """Search Gamma for 5-min BTC up/down markets by slug pattern btc-updown-5m-*."""
+    from config.settings import settings
+    gamma_api = settings.polymarket_gamma_host.rstrip("/")
     found: list[dict] = []
     seen: set[str] = set()
 
     try:
         resp = client.get(
-            f"{GAMMA_API}/events",
+            f"{gamma_api}/events",
+            params={"active": "true", "closed": "false", "limit": 200},
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        if not isinstance(events, list):
+            return found
+
+        for e in events:
+            slug = (e.get("slug") or e.get("slugId") or "").lower()
+            if "btc-updown" in slug or "btc-up-down" in slug or "5m-" in slug:
+                title = e.get("title", "")
+                if not _is_btc(title) and "btc" not in slug:
+                    continue
+                for m in e.get("markets", []):
+                    cid = m.get("conditionId", "")
+                    if not cid or cid in seen:
+                        continue
+                    clob_ids = m.get("clobTokenIds", [])
+                    if isinstance(clob_ids, str):
+                        try:
+                            clob_ids = json.loads(clob_ids)
+                        except Exception:
+                            clob_ids = []
+                    if not clob_ids or not isinstance(clob_ids, list):
+                        continue
+                    end_str = m.get("endDate", "")
+                    days = _days_until(end_str)
+                    if days is not None and days < 0:
+                        continue
+                    seen.add(cid)
+                    row = {
+                        "token_id": str(clob_ids[0]),
+                        "question": m.get("question", f"BTC 5m up/down ({slug})"),
+                        "end_date": end_str,
+                        "condition_id": cid,
+                        "liquidity": float(m.get("liquidity", 0) or 0),
+                        "days_until_end": days,
+                        "source": "gamma_5m_slug",
+                        "market_type": "5min",
+                        "event_title": title,
+                        "event_slug": slug or e.get("slug") or e.get("slugId", ""),
+                    }
+                    found.append(row)
+                    logger.info("[5m slug] %s | %.0f USDC liq", slug[:50], row["liquidity"])
+    except Exception as exc:
+        logger.warning("Gamma 5m slug search failed: %s", exc)
+    return found
+
+
+def _gamma_events_search(client: httpx.Client) -> list[dict]:
+    """Search Gamma events endpoint for BTC/crypto events with embedded markets."""
+    from config.settings import settings
+    gamma_api = settings.polymarket_gamma_host.rstrip("/")
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    try:
+        resp = client.get(
+            f"{gamma_api}/events",
             params={"active": "true", "closed": "false", "limit": 200},
         )
         resp.raise_for_status()
@@ -373,6 +437,12 @@ def find_all_btc_markets(limit: int = 200) -> list[dict]:
     seen_tokens: set[str] = set()
 
     with httpx.Client(timeout=30.0) as client:
+        logger.info("Searching Gamma API (5m slug first)...")
+        for m in _gamma_events_search_5m(client):
+            if m["token_id"] not in seen_tokens:
+                seen_tokens.add(m["token_id"])
+                found.append(m)
+
         logger.info("Searching Gamma API...")
         for m in _gamma_search(client):
             if m["token_id"] not in seen_tokens:

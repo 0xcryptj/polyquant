@@ -3,154 +3,385 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="PolyQuant trading terminal — paper trading, live BTC signals, adaptive strategy">
   <title>PolyQuant Terminal</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div id="app">
-    <header class="terminal-header">
-      <div class="logo">
-        <span class="logo-icon">◆</span>
-        <h1>PolyQuant</h1>
-        <span class="mode-badge" id="mode-badge">Paper</span>
+<div id="app">
+
+  <!-- ═══ SIDEBAR NAV ═══════════════════════════════════════════════════════ -->
+  <nav class="sidebar-nav">
+    <div class="nav-logo">
+      <span class="logo-mark">◆</span>
+      <span class="logo-txt">PQ</span>
+    </div>
+    <button class="nav-btn active" data-view="dashboard" title="Dashboard">DASH</button>
+    <button class="nav-btn" data-view="positions" title="Open Positions">POS</button>
+    <button class="nav-btn" data-view="trades" title="Trade History">TRADES</button>
+    <button class="nav-btn" data-view="performance" title="Performance Metrics">PERF</button>
+    <button class="nav-btn" data-view="sentiment" title="Market Intelligence">INTEL</button>
+    <button class="nav-btn" data-view="controls" title="System Controls">CTRL</button>
+  </nav>
+
+  <!-- ═══ MAIN CONTENT ═══════════════════════════════════════════════════════ -->
+  <main class="main-content">
+
+    <!-- ── Ticker Bar ─────────────────────────────────────────────────────── -->
+    <header class="ticker-bar">
+      <div class="tb-brand">◆ POLYQUANT</div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item tb-btc-main">
+        <span class="tb-label">BTC</span>
+        <span class="tb-val accent tb-btc-big" id="t-btc-price">—</span>
+        <span class="tb-val" id="t-btc-change">—</span>
       </div>
-      <div class="header-stats" id="header-stats">
-        <div class="stat">
-          <span class="stat-label">Total Equity</span>
-          <span class="stat-value" id="stat-bankroll">—</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Total Profit</span>
-          <span class="stat-value profit" id="stat-profit">—</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Win Rate</span>
-          <span class="stat-value" id="stat-winrate">—</span>
-        </div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item">
+        <span class="tb-label">ETH</span>
+        <span class="tb-val" id="t-eth-price">—</span>
       </div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item">
+        <span class="tb-label">SOL</span>
+        <span class="tb-val" id="t-sol-price">—</span>
+      </div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item">
+        <span class="tb-label">F&amp;G</span>
+        <span class="tb-val" id="t-fg">—</span>
+      </div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item">
+        <span class="tb-label">FUND</span>
+        <span class="tb-val" id="t-fund">—</span>
+      </div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item">
+        <span class="tb-label">MODE</span>
+        <span class="tb-val" id="t-mode">PAPER</span>
+      </div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item">
+        <span class="tb-val" id="t-open">0</span>
+        <span class="tb-label">POS</span>
+      </div>
+      <div class="tb-divider">│</div>
+      <div class="tb-item">
+        <span class="tb-live">LIVE</span>
+      </div>
+      <div class="tb-spacer"></div>
+      <div class="tb-clock" id="tb-clock">—</div>
     </header>
 
-    <main class="terminal-main">
-      <section class="panel bankroll-panel">
-        <div class="bankroll-row">
-          <h2>Bankroll & PnL</h2>
-          <div class="bankroll-grid">
-          <div class="card">
-            <span class="card-label">Available</span>
-            <span class="card-value" id="bankroll-available">—</span>
-          </div>
-          <div class="card">
-            <span class="card-label">In Positions</span>
-            <span class="card-value" id="bankroll-locked">—</span>
-          </div>
-          <div class="card">
-            <span class="card-label">Total Equity</span>
-            <span class="card-value" id="bankroll-total">—</span>
-          </div>
-          <div class="card">
-            <span class="card-label">Baseline</span>
-            <span class="card-value" id="bankroll-baseline">—</span>
-          </div>
-          <div class="card">
-            <span class="card-label">Profit (Since Reset)</span>
-            <span class="card-value profit" id="bankroll-profit">—</span>
-          </div>
-          <div class="card">
-            <span class="card-label">Return %</span>
-            <span class="card-value" id="bankroll-return">—</span>
-          </div>
-        </div>
-        <p class="markets-notice" id="markets-notice"></p>
-        <div class="charts-row">
-          <div class="chart-container chart-pnl">
-            <canvas id="pnl-chart"></canvas>
-          </div>
-          <div class="chart-container chart-btc">
-            <canvas id="btc-chart"></canvas>
-          </div>
-        </div>
-        <div class="trade-grid-panel">
-          <h3>Trade History <span class="grid-legend"><span class="legend-win">■</span> Win</span><span class="grid-legend"><span class="legend-loss">■</span> Loss</span></h3>
-          <div class="trade-grid" id="trade-grid"></div>
-        </div>
-      </section>
+    <div class="pages-wrap">
 
-      <section class="panel positions-panel">
-        <h2>Open Positions</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Dir</th>
-                <th>Type</th>
-                <th>Question</th>
-                <th>Shares</th>
-                <th>Size</th>
-                <th>Avg</th>
-                <th>To Win</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="positions-body">
-              <tr><td colspan="9" class="empty">No open positions</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: DASHBOARD — 3-column Bloomberg grid
+           ════════════════════════════════════════════════════════ -->
+      <div class="page active" id="page-dashboard">
 
-      <section class="panel trades-panel">
-        <h2>Recent Trades</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Dir</th>
-                <th>Type</th>
-                <th>Question</th>
-                <th>Shares</th>
-                <th>Size</th>
-                <th>P&L</th>
-                <th>Avg</th>
-                <th>Exit</th>
-                <th>To Win</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="trades-body">
-              <tr><td colspan="11" class="empty">No trades yet</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <aside class="controls-panel">
-        <h2>Controls</h2>
-        <div class="control-group">
-          <label>Mode</label>
-          <div class="toggle-row">
-            <button class="toggle-btn active" data-mode="paper">Paper</button>
-            <button class="toggle-btn" data-mode="live">Live</button>
+        <!-- Metric Cards Row -->
+        <div class="cards-row">
+          <div class="mcard" id="mc-equity">
+            <div class="mc-lbl">EQUITY</div>
+            <div class="mc-val" id="mv-equity">—</div>
+            <div class="mc-sub" id="ms-equity">—</div>
           </div>
-          <p class="control-hint">Restart bot to apply</p>
+          <div class="mcard" id="mc-avail">
+            <div class="mc-lbl">AVAIL</div>
+            <div class="mc-val" id="mv-avail">—</div>
+            <div class="mc-sub" id="ms-avail">free</div>
+          </div>
+          <div class="mcard" id="mc-locked">
+            <div class="mc-lbl">LOCKED</div>
+            <div class="mc-val" id="mv-locked">—</div>
+            <div class="mc-sub" id="ms-locked">—</div>
+          </div>
+          <div class="mcard" id="mc-pnl">
+            <div class="mc-lbl">TOTAL P&amp;L</div>
+            <div class="mc-val" id="mv-pnl">—</div>
+            <div class="mc-sub" id="ms-pnl">—</div>
+          </div>
+          <div class="mcard" id="mc-daily">
+            <div class="mc-lbl">DAILY P&amp;L</div>
+            <div class="mc-val" id="mv-daily">—</div>
+            <div class="mc-sub" id="ms-daily">—</div>
+          </div>
+          <div class="mcard" id="mc-trades">
+            <div class="mc-lbl">TRADES</div>
+            <div class="mc-val" id="mv-trades">—</div>
+            <div class="mc-sub" id="ms-trades">—</div>
+          </div>
+          <div class="mcard" id="mc-wr">
+            <div class="mc-lbl">WIN RATE</div>
+            <div class="mc-val" id="mv-wr">—</div>
+            <div class="mc-sub" id="ms-wr">—</div>
+          </div>
+          <div class="mcard" id="mc-edge">
+            <div class="mc-lbl">EDGE/KELLY</div>
+            <div class="mc-val" id="mv-edge">—</div>
+            <div class="mc-sub" id="ms-edge">—</div>
+          </div>
         </div>
-        <div class="control-group">
-          <label>Reset Bankroll</label>
-          <input type="number" id="reset-amount" value="1000" min="100" step="100">
-          <button class="btn btn-danger" id="btn-reset">Reset to $1000</button>
+
+        <!-- 3-Column Bloomberg Grid -->
+        <div class="dash-grid">
+
+          <!-- ── Left Column: BTC chart + mini positions ──────── -->
+          <div class="dash-col">
+            <div class="panel chart-sm" aria-label="BTC price chart">
+              <div class="ph">
+                <span class="ph-title">BTC / USD</span>
+                <span class="ph-badge" id="btc-badge">—</span>
+              </div>
+              <div class="chart-body">
+                <canvas id="btc-chart"></canvas>
+              </div>
+            </div>
+            <div class="panel panel-flex" aria-label="Open positions">
+              <div class="ph">
+                <span class="ph-title">POSITIONS</span>
+                <span class="ph-count" id="pos-count">0</span>
+              </div>
+              <div class="tscroll">
+                <table class="mini-tbl">
+                  <thead><tr>
+                    <th>#</th><th>DIR</th><th>SIZE</th><th>ENTRY</th><th>TO WIN</th>
+                  </tr></thead>
+                  <tbody id="dash-pos-body">
+                    <tr><td colspan="5" class="empty">No open positions</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── Center Column: Activity feed ────────────────── -->
+          <div class="dash-col">
+            <div class="panel panel-flex" aria-label="Orders and outcomes" role="log">
+              <div class="ph">
+                <span class="ph-title">ORDERS &amp; OUTCOMES</span>
+                <span class="ph-count" id="activity-count">0</span>
+              </div>
+              <div class="activity-feed tscroll" id="activity-feed" aria-live="polite">
+                <div class="empty" id="activity-placeholder">Loading…</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── Right Column: Equity chart + perf + grid ────── -->
+          <div class="dash-col">
+            <div class="panel chart-sm" aria-label="Equity curve">
+              <div class="ph">
+                <span class="ph-title">EQUITY</span>
+                <span class="ph-badge" id="pnl-badge">—</span>
+              </div>
+              <div class="chart-body">
+                <canvas id="pnl-chart"></canvas>
+              </div>
+            </div>
+            <div class="panel panel-flex" aria-label="Performance metrics">
+              <div class="ph">
+                <span class="ph-title">PERFORMANCE</span>
+              </div>
+              <div class="perf-body">
+                <div class="prow"><span class="pk">SHARPE</span><span class="pv" id="pv-sharpe">—</span></div>
+                <div class="prow"><span class="pk">BRIER</span><span class="pv" id="pv-brier">—</span></div>
+                <div class="prow"><span class="pk">MAX DD</span><span class="pv" id="pv-maxdd">—</span></div>
+                <div class="prow"><span class="pk">AVG EDGE</span><span class="pv" id="pv-edge">—</span></div>
+                <div class="prow"><span class="pk">AVG P&amp;L</span><span class="pv" id="pv-apnl">—</span></div>
+                <div class="prow"><span class="pk">MARKETS</span><span class="pv" id="pv-markets">—</span></div>
+              </div>
+            </div>
+            <div class="panel grid-sm" aria-label="Win/loss grid">
+              <div class="ph">
+                <span class="ph-title">WIN / LOSS</span>
+                <span class="ph-legend"><span class="leg-w">■</span> W <span class="leg-l">■</span> L</span>
+              </div>
+              <div class="tgrid-wrap" id="trade-grid"></div>
+            </div>
+          </div>
+
+        </div><!-- /dash-grid -->
+      </div><!-- /page-dashboard -->
+
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: POSITIONS
+           ════════════════════════════════════════════════════════ -->
+      <div class="page" id="page-positions">
+        <div class="panel full-page-panel">
+          <div class="ph">
+            <span class="ph-title">OPEN POSITIONS</span>
+            <span class="ph-count" id="pos-count-full">0</span>
+          </div>
+          <div class="tscroll">
+            <table>
+              <thead><tr>
+                <th>ID</th><th>DIR</th><th>TYPE</th><th>MARKET</th>
+                <th>SHARES</th><th>SIZE</th><th>ENTRY</th><th>VALUE</th><th>TO WIN</th><th></th>
+              </tr></thead>
+              <tbody id="positions-body">
+                <tr><td colspan="10" class="empty">No open positions</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
-        <div class="control-group">
-          <label>Wallet</label>
-          <div class="wallet-info" id="wallet-info">—</div>
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: TRADES
+           ════════════════════════════════════════════════════════ -->
+      <div class="page" id="page-trades">
+        <div class="panel full-page-panel">
+          <div class="ph">
+            <span class="ph-title">TRADE HISTORY</span>
+            <span class="ph-count" id="trade-count">0</span>
+          </div>
+          <div class="tscroll">
+            <table>
+              <thead><tr>
+                <th>ID</th><th>DIR</th><th>TYPE</th><th>RESULT</th><th>MARKET</th>
+                <th>SIZE</th><th>P&amp;L</th><th>BTC IN</th><th>BTC OUT</th><th></th>
+              </tr></thead>
+              <tbody id="trades-body">
+                <tr><td colspan="10" class="empty">No closed trades yet</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
-      </aside>
-    </main>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="/static/app.js"></script>
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: PERFORMANCE
+           ════════════════════════════════════════════════════════ -->
+      <div class="page" id="page-performance">
+        <div class="perf-grid-page">
+          <div class="panel full-page-panel perf-detail-panel">
+            <div class="ph"><span class="ph-title">PERFORMANCE METRICS</span></div>
+            <div class="perf-body">
+              <div class="prow"><span class="pk">SHARPE RATIO</span><span class="pv" id="pv-sharpe2">—</span></div>
+              <div class="prow"><span class="pk">BRIER SCORE</span><span class="pv" id="pv-brier2">—</span></div>
+              <div class="prow"><span class="pk">MAX DRAWDOWN</span><span class="pv" id="pv-maxdd2">—</span></div>
+              <div class="prow"><span class="pk">AVG EDGE</span><span class="pv" id="pv-edge2">—</span></div>
+              <div class="prow"><span class="pk">AVG P&amp;L / TRADE</span><span class="pv" id="pv-apnl2">—</span></div>
+              <div class="prow"><span class="pk">MARKETS MODE</span><span class="pv" id="pv-markets2">—</span></div>
+            </div>
+          </div>
+          <div class="panel full-page-panel">
+            <div class="ph">
+              <span class="ph-title">TRADE HISTORY GRID</span>
+              <span class="ph-legend"><span class="leg-w">■</span> WIN <span class="leg-l">■</span> LOSS</span>
+            </div>
+            <div class="tgrid-wrap tgrid-full" id="trade-grid-perf"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: INTELLIGENCE (Sentiment / Learn / Wallets)
+           ════════════════════════════════════════════════════════ -->
+      <div class="page" id="page-sentiment">
+        <div class="panel full-page-panel">
+          <div class="ph">
+            <span class="ph-title">MARKET INTELLIGENCE</span>
+            <div class="insight-tabs">
+              <button class="itab active" data-tab="sentiment">SENTIMENT</button>
+              <button class="itab" data-tab="learn">LEARNING</button>
+              <button class="itab" data-tab="wallets">WALLETS</button>
+            </div>
+          </div>
+          <div class="insights-body">
+            <div class="insight-pane active" id="pane-sentiment"><pre id="insight-sentiment">—</pre></div>
+            <div class="insight-pane" id="pane-learn"><pre id="insight-learn">—</pre></div>
+            <div class="insight-pane" id="pane-wallets"><pre id="insight-wallets">—</pre></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: CONTROLS
+           ════════════════════════════════════════════════════════ -->
+      <div class="page" id="page-controls">
+        <div class="controls-grid">
+          <div class="panel ctrl-panel">
+            <div class="ph"><span class="ph-title">SYSTEM STATUS</span></div>
+            <div class="ctrl-body">
+              <div class="cs-row"><span class="csk">Market Mode</span><span class="csv" id="ctrl-market-mode">—</span></div>
+              <div class="cs-row"><span class="csk">Trading</span><span class="csv" id="ctrl-trading">—</span></div>
+              <div class="cs-row"><span class="csk">Open Positions</span><span class="csv" id="ctrl-open">—</span></div>
+              <div class="cs-row"><span class="csk">Kill Switch</span><span class="csv" id="ctrl-kill">—</span></div>
+              <div class="cs-row"><span class="csk">Refresh</span><span class="csv" id="ctrl-refresh">—</span></div>
+            </div>
+          </div>
+          <div class="panel ctrl-panel">
+            <div class="ph"><span class="ph-title">TRADING PARAMS</span></div>
+            <div class="ctrl-body">
+              <div class="cs-row"><span class="csk">Min Edge</span><span class="csv" id="ctrl-min-edge">—</span></div>
+              <div class="cs-row"><span class="csk">Kelly Fraction</span><span class="csv" id="ctrl-kelly">—</span></div>
+              <div class="cs-row"><span class="csk">Max Position</span><span class="csv" id="ctrl-max-pos">—</span></div>
+              <div class="cs-row"><span class="csk">Max Spread</span><span class="csv" id="ctrl-max-spread">—</span></div>
+            </div>
+          </div>
+          <div class="panel ctrl-panel cmd-panel">
+            <div class="ph"><span class="ph-title">TRADING</span></div>
+            <div class="cmd-body">
+              <div class="crow">
+                <button class="cbtn resume" id="btn-resume" style="display:none">RESUME</button>
+                <button class="cbtn pause" id="btn-pause">PAUSE</button>
+              </div>
+              <div class="chint" id="trading-state-hint">—</div>
+            </div>
+          </div>
+          <div class="panel ctrl-panel cmd-panel">
+            <div class="ph"><span class="ph-title">MODE</span></div>
+            <div class="cmd-body">
+              <div class="crow">
+                <button class="mbtn active" data-mode="paper">PAPER</button>
+                <button class="mbtn" data-mode="live">LIVE</button>
+              </div>
+              <div class="chint">Restart bot to apply</div>
+            </div>
+          </div>
+          <div class="panel ctrl-panel cmd-panel">
+            <div class="ph"><span class="ph-title">RESET BANKROLL</span></div>
+            <div class="cmd-body">
+              <div class="crow">
+                <input type="number" id="reset-amount" value="1000" min="100" step="100">
+                <button class="cbtn danger" id="btn-reset">RESET</button>
+              </div>
+            </div>
+          </div>
+          <div class="panel ctrl-panel cmd-panel">
+            <div class="ph"><span class="ph-title">ACTIONS</span></div>
+            <div class="cmd-body">
+              <div class="crow cmd-actions">
+                <button class="cbtn secondary" id="btn-find-markets">FIND MARKETS</button>
+                <button class="cbtn secondary" id="btn-live-check">LIVE CHECK</button>
+              </div>
+              <p class="ctrl-hint">Find Markets discovers Polymarket BTC 5-min up/down markets.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /pages-wrap -->
+
+    <!-- ── Footer Sentiment Ticker ──────────────────────────────────────── -->
+    <footer class="footer-ticker">
+      <div class="ft-label">SENTIMENT</div>
+      <div class="ft-scroll-wrap">
+        <div class="ft-scroll" id="footer-sentiment">Loading market data…</div>
+      </div>
+    </footer>
+
+  </main>
+</div><!-- /#app -->
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="/static/app.js" defer></script>
 </body>
 </html>

@@ -13,10 +13,12 @@ Features:
 from __future__ import annotations
 
 import json
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -25,6 +27,13 @@ from pydantic import BaseModel
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 app = FastAPI(title="PolyQuant Terminal", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Mount static files
 static_dir = PROJECT_ROOT / "web" / "static"
@@ -77,6 +86,7 @@ def _load_status_from_db() -> dict:
     total_pnl = total_equity - starting
     return_pct = 100 * (total_equity / starting - 1) if starting else 0
     win_rate = (counts["wins"] or 0) / max((counts["wins"] or 0) + (counts["losses"] or 0), 1)
+    daily = db.get_daily_trade_stats()
     return {
         "balance": balance,
         "starting_balance": starting,
@@ -92,6 +102,8 @@ def _load_status_from_db() -> dict:
         "win_rate": win_rate,
         "kill_switch": False,
         "kill_switch_reason": "",
+        "daily_pnl": daily.get("daily_pnl", 0.0),
+        "trades_today": daily.get("trades_today", 0),
     }
 
 
@@ -149,8 +161,56 @@ def _polymarket_url(token_id: str, meta: dict | None = None) -> str:
     return f"https://polymarket.com/?tid={token_id}" if token_id else "https://polymarket.com"
 
 
-def _get_market_meta(token_id: str) -> dict:
-    """Get market metadata (question, condition_id, event_slug, etc.) from config."""
+def _display_label_for_trade(r: dict, meta: dict) -> tuple[str, str]:
+    """
+    Return (question_display, market_type) for positions/trades.
+    All 5-min and SIM trades show as 'Polymarket BTC 5m UP' / 'Polymarket BTC 5m DOWN'.
+    """
+    token_id = (r.get("token_id") or "").strip()
+    direction = (r.get("direction") or "YES").upper()
+    dir_short = "UP" if direction == "YES" else "DOWN"
+    btc_5m_label = f"Polymarket BTC 5m {dir_short}"
+
+    if token_id.startswith("SIM-"):
+        return btc_5m_label, "5min"
+    if (meta.get("market_type") or "").lower() == "5min":
+        return btc_5m_label, "5min"
+    # When meta is empty (legacy trades), treat as 5m directional
+    q = meta.get("question") or meta.get("event_title")
+    if not q:
+        return btc_5m_label, "5min"
+    return q[:80] + ("…" if len(q) > 80 else ""), meta.get("market_type", "price")
+
+
+def _load_markets_index() -> dict[str, dict]:
+    """Load btc_markets.json once and index by token_id. Use per-request for dashboard."""
+    try:
+        cfg_path = PROJECT_ROOT / "config" / "btc_markets.json"
+        with open(cfg_path) as f:
+            markets = json.load(f)
+        idx = {}
+        for m in markets:
+            tid = m.get("token_id")
+            if not tid:
+                continue
+            out = dict(m)
+            if (out.get("market_type") or "").lower() == "5min":
+                if not (out.get("event_slug") or "").startswith("btc-updown-5m-") and out.get("end_date"):
+                    slug_5m = _slug_for_5m_from_end_date(out["end_date"])
+                    if slug_5m:
+                        out["event_slug"] = slug_5m
+            if not out.get("event_slug") and (out.get("event_title") or out.get("question")):
+                out["event_slug"] = _slug_from_title(out.get("event_title") or out.get("question", ""))
+            idx[tid] = out
+        return idx
+    except Exception:
+        return {}
+
+
+def _get_market_meta(token_id: str, markets_index: dict[str, dict] | None = None) -> dict:
+    """Get market metadata. Pass markets_index to avoid repeated file reads."""
+    if markets_index is not None:
+        return markets_index.get(token_id or "", {})
     try:
         cfg_path = PROJECT_ROOT / "config" / "btc_markets.json"
         with open(cfg_path) as f:
@@ -158,7 +218,6 @@ def _get_market_meta(token_id: str) -> dict:
         for m in markets:
             if m.get("token_id") == token_id:
                 out = dict(m)
-                # For 5m markets, prefer btc-updown-5m-{window_start_unix} from config or end_date
                 if (out.get("market_type") or "").lower() == "5min":
                     if not (out.get("event_slug") or "").startswith("btc-updown-5m-") and out.get("end_date"):
                         slug_5m = _slug_for_5m_from_end_date(out["end_date"])
@@ -210,10 +269,12 @@ async def index():
 
 @app.get("/api/status")
 async def api_status():
-    """Get current status (balance, PnL, counts)."""
-    s = _load_engine_status()
-    if s is None:
-        s = _load_status_from_db()
+    """Get current status (balance, PnL, counts). Always uses DB for fast response."""
+    s = _load_status_from_db()
+    from config.settings import settings
+    s.setdefault("paper_trading", settings.paper_trading)
+    ov = _read_mode_override()
+    s["trading_paused"] = ov.get("trading_paused", False)
     return s
 
 
@@ -250,11 +311,12 @@ async def api_positions():
                 current_value = round(shares * current_price, 2)
             else:
                 current_value = round(shares * (1.0 - current_price), 2)
+        q_display, mtype = _display_label_for_trade(r, meta)
         pos = {
             **dict(r),
-            "question": meta.get("question") or f"Unknown market ({token_id[:12]}…)",
-            "market_type": meta.get("market_type", ""),
-            "market_label": _market_label(meta.get("market_type", "")),
+            "question": q_display,
+            "market_type": mtype,
+            "market_label": _market_label(mtype),
             "event_title": meta.get("event_title", ""),
             "event_slug": meta.get("event_slug", ""),
             "condition_id": meta.get("condition_id"),
@@ -266,6 +328,152 @@ async def api_positions():
         }
         positions.append(pos)
     return positions
+
+
+@app.get("/api/activity")
+async def api_activity(limit: int = 30):
+    """Recent activity: open positions + recent closed trades. Fast, DB-only (no Polymarket fetches)."""
+    from paper_trading import persistence as db
+    db.init_db()
+    opens = db.get_open_trades()
+    closed = db.get_recent_trades(max(limit, 15))
+    items = []
+    for r in opens:
+        meta = _get_market_meta(r["token_id"])
+        q_display, _ = _display_label_for_trade(r, meta)
+        shares = _shares_from_row(r)
+        entry = float(r.get("entry_price") or 0)
+        direction = (r.get("direction") or "YES").upper()
+        to_win = round(_to_win(shares, entry, direction), 2)
+        items.append({
+            "type": "open",
+            "id": r.get("id"),
+            "direction": r.get("direction", "YES"),
+            "market": q_display,
+            "size_usdc": float(r.get("size_usdc") or 0),
+            "to_win": to_win,
+            "opened_at": r.get("opened_at"),
+            "btc_entry": r.get("btc_price_entry"),
+        })
+    for r in closed:
+        meta = _get_market_meta(r["token_id"])
+        q_display, _ = _display_label_for_trade(r, meta)
+        pnl = r.get("pnl") or 0
+        status = (r.get("status") or "lost").lower()
+        if status == "lost" and pnl >= 0:
+            pnl = -abs(float(r.get("size_usdc") or 0))
+        items.append({
+            "type": "closed",
+            "id": r.get("id"),
+            "direction": r.get("direction", "YES"),
+            "market": q_display,
+            "size_usdc": float(r.get("size_usdc") or 0),
+            "pnl": pnl,
+            "status": status,
+            "resolved_at": r.get("resolved_at"),
+        })
+    # Sort: opens first (by opened_at desc), then closed (by resolved_at desc)
+    def _ts(it):
+        s = it.get("opened_at") or it.get("resolved_at") or ""
+        return s
+    items.sort(key=_ts, reverse=True)
+    return items[:limit]
+
+
+@app.get("/api/dashboard")
+async def api_dashboard():
+    """Single fast endpoint: status + activity + positions + trades. Batched DB + cached markets."""
+    from paper_trading import persistence as db
+    db.init_db()
+    data = db.get_dashboard_data(n_closed=25)
+    markets = _load_markets_index()
+
+    status = {
+        "balance": data["balance"],
+        "starting_balance": data["starting_balance"],
+        "locked_in_positions": data["locked_in_positions"],
+        "total_equity": data["total_equity"],
+        "return_pct": data["return_pct"],
+        "total_pnl": data["total_pnl"],
+        "all_time_pnl": data["all_time_pnl"],
+        "n_open": data["n_open"],
+        "n_wins": data["n_wins"],
+        "n_losses": data["n_losses"],
+        "n_total": data["n_total"],
+        "win_rate": data["win_rate"],
+        "daily_pnl": data["daily_pnl"],
+        "trades_today": data["trades_today"],
+        "kill_switch": False,
+        "kill_switch_reason": "",
+    }
+    from config.settings import settings
+    status.setdefault("paper_trading", settings.paper_trading)
+    ov = _read_mode_override()
+    status["trading_paused"] = ov.get("trading_paused", False)
+
+    p = db.get_all_params()
+    status["params"] = {
+        "min_edge": p.get("min_edge", settings.min_edge_threshold),
+        "kelly_fraction": p.get("kelly_fraction", settings.kelly_fraction),
+    }
+
+    opens, closed = data["opens"], data["closed"]
+    activity = []
+    for r in opens:
+        meta = _get_market_meta(r.get("token_id") or "", markets)
+        q_display, _ = _display_label_for_trade(r, meta)
+        shares = _shares_from_row(r)
+        entry = float(r.get("entry_price") or 0)
+        direction = (r.get("direction") or "YES").upper()
+        to_win = round(_to_win(shares, entry, direction), 2)
+        activity.append({
+            "type": "open", "id": r.get("id"), "direction": r.get("direction", "YES"),
+            "market": q_display, "size_usdc": float(r.get("size_usdc") or 0),
+            "to_win": to_win, "opened_at": r.get("opened_at"), "btc_entry": r.get("btc_price_entry"),
+        })
+    for r in closed:
+        meta = _get_market_meta(r.get("token_id") or "", markets)
+        q_display, _ = _display_label_for_trade(r, meta)
+        pnl = r.get("pnl") or 0
+        status_val = (r.get("status") or "lost").lower()
+        if status_val == "lost" and pnl >= 0:
+            pnl = -abs(float(r.get("size_usdc") or 0))
+        activity.append({
+            "type": "closed", "id": r.get("id"), "direction": r.get("direction", "YES"),
+            "market": q_display, "size_usdc": float(r.get("size_usdc") or 0),
+            "pnl": pnl, "status": status_val, "resolved_at": r.get("resolved_at"),
+        })
+    activity.sort(key=lambda x: x.get("opened_at") or x.get("resolved_at") or "", reverse=True)
+
+    positions = []
+    for r in opens:
+        meta = _get_market_meta(r.get("token_id") or "", markets)
+        shares = _shares_from_row(r)
+        entry = float(r.get("entry_price") or 0)
+        direction = (r.get("direction") or "").upper()
+        to_win = round(_to_win(shares, entry, direction), 2)
+        q_display, mtype = _display_label_for_trade(r, meta)
+        token_id = r.get("token_id") or ""
+        positions.append({
+            **dict(r), "question": q_display, "market_type": mtype,
+            "shares": round(shares, 4), "to_win": to_win,
+            "current_value": None, "polymarket_url": _polymarket_url(token_id, meta),
+        })
+
+    trades = []
+    for r in closed:
+        meta = _get_market_meta(r.get("token_id") or "", markets)
+        q_display, mtype = _display_label_for_trade(r, meta)
+        shares = _shares_from_row(r)
+        entry = float(r.get("entry_price") or 0)
+        direction = r.get("direction", "")
+        trades.append({
+            **dict(r), "question": q_display, "market_type": mtype,
+            "shares": round(shares, 4), "to_win": round(_to_win(shares, entry, direction), 2),
+            "polymarket_url": _polymarket_url(r.get("token_id") or "", meta),
+        })
+
+    return {"status": status, "activity": activity, "positions": positions, "trades": trades}
 
 
 @app.get("/api/trades")
@@ -281,14 +489,15 @@ async def api_trades(limit: int = 50):
     trades = []
     for r in rows:
         meta = _get_market_meta(r["token_id"])
+        q_display, mtype = _display_label_for_trade(r, meta)
         shares = _shares_from_row(r)
         entry = float(r.get("entry_price") or 0)
         direction = r.get("direction", "")
         trades.append({
             **dict(r),
-            "question": meta.get("question") or f"Unknown market ({r.get('token_id', '')[:12]}…)",
-            "market_type": meta.get("market_type", ""),
-            "market_label": _market_label(meta.get("market_type", "")),
+            "question": q_display,
+            "market_type": mtype,
+            "market_label": _market_label(mtype),
             "event_title": meta.get("event_title", ""),
             "event_slug": meta.get("event_slug", ""),
             "condition_id": meta.get("condition_id"),
@@ -334,6 +543,7 @@ async def api_params():
         "kelly_fraction": p.get("kelly_fraction", settings.kelly_fraction),
         "max_spread": p.get("max_spread", settings.max_spread),
         "max_position_usdc": settings.max_position_usdc,
+        "position_pct": 5,
         "paper_trading": settings.paper_trading,
     }
 
@@ -342,15 +552,57 @@ class ModeUpdate(BaseModel):
     paper_trading: bool
 
 
+def _read_mode_override() -> dict:
+    """Read mode override file (paper_trading, trading_paused)."""
+    override_path = PROJECT_ROOT / "config" / "mode_override.json"
+    if not override_path.exists():
+        return {"paper_trading": True, "trading_paused": False}
+    try:
+        with open(override_path) as f:
+            data = json.load(f)
+        return {
+            "paper_trading": data.get("paper_trading", True),
+            "trading_paused": data.get("trading_paused", False),
+        }
+    except Exception:
+        return {"paper_trading": True, "trading_paused": False}
+
+
+def _write_mode_override(updates: dict) -> None:
+    """Merge updates into mode_override.json."""
+    override_path = PROJECT_ROOT / "config" / "mode_override.json"
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    current = _read_mode_override()
+    current.update(updates)
+    with open(override_path, "w") as f:
+        json.dump(current, f, indent=2)
+
+
 @app.post("/api/mode")
 async def api_set_mode(body: ModeUpdate):
     """Request mode change (paper/live). Requires restart to apply."""
-    # Write to override file - bot would need to check this
-    override_path = PROJECT_ROOT / "config" / "mode_override.json"
-    override_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(override_path, "w") as f:
-        json.dump({"paper_trading": body.paper_trading}, f)
+    _write_mode_override({"paper_trading": body.paper_trading})
     return {"ok": True, "message": "Mode update saved. Restart the bot to apply."}
+
+
+@app.post("/api/pause")
+async def api_pause():
+    """Pause trading loop. Bot reads this each cycle."""
+    _write_mode_override({"trading_paused": True})
+    return {"ok": True, "trading_paused": True}
+
+
+@app.post("/api/resume")
+async def api_resume():
+    """Resume trading loop."""
+    _write_mode_override({"trading_paused": False})
+    return {"ok": True, "trading_paused": False}
+
+
+@app.get("/api/trading-state")
+async def api_trading_state():
+    """Get current trading state (paused, paper_trading)."""
+    return _read_mode_override()
 
 
 @app.post("/api/reset")
@@ -407,8 +659,11 @@ async def api_markets_summary():
             if t == "5min":
                 has_5min = True
         notice = None
-        if not has_5min and by_type:
-            notice = "Configured markets are not 5-min. Run: python scripts/find_btc_markets.py"
+        if not has_5min:
+            if not by_type:
+                notice = "SIM mode — no 5-min Polymarket markets. Use FIND MARKETS to discover."
+            else:
+                notice = "No 5-min markets. Use FIND MARKETS (5min-only)."
         return {"has_5min": has_5min, "total": len(markets), "by_type": by_type, "notice": notice}
     except Exception as e:
         return {"has_5min": False, "total": 0, "by_type": {}, "notice": str(e)}
@@ -421,7 +676,7 @@ async def api_trade_grid():
     db.init_db()
     rows = db.get_all_closed_trades()
     return [
-        {"id": r["id"], "pnl": r.get("pnl") or 0, "status": r.get("status", "won")}
+        {"id": r["id"], "pnl": r.get("pnl") or 0, "status": r.get("status", "won"), "size_usdc": r.get("size_usdc")}
         for r in rows
     ]
 
@@ -467,9 +722,9 @@ async def api_btc_chart(limit: int = 120):
         url = f"{base}/api/v3/coins/bitcoin/market_chart"
         params = {"vs_currency": "usd", "days": "1"}
         headers = {}
-        if getattr(settings, "coingecko_api_key", None) and settings.coingecko_api_key:
+        if settings.coingecko_api_key:
             headers["x-cg-demo-api-key"] = settings.coingecko_api_key
-        async with httpx.AsyncClient(timeout=15.0) as c:
+        async with httpx.AsyncClient(timeout=8.0) as c:
             r = await c.get(url, params=params, headers=headers or None)
             r.raise_for_status()
             data = r.json()
@@ -483,3 +738,264 @@ async def api_btc_chart(limit: int = 120):
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Ticker & Performance endpoints ────────────────────────────────────────────
+
+_ticker_cache: dict = {}
+_ticker_cache_ts: float = 0.0
+_TICKER_TTL = 12.0   # seconds
+
+
+@app.get("/api/ticker")
+async def api_ticker():
+    """
+    Live BTC price, 1-hour change, Fear & Greed, and funding rate for the ticker bar.
+    Cached for 30 s so rapid dashboard refreshes don't hammer external APIs.
+    """
+    global _ticker_cache, _ticker_cache_ts
+    now = _time.monotonic()
+    if _ticker_cache and now - _ticker_cache_ts < _TICKER_TTL:
+        return _ticker_cache
+
+    result: dict = {
+        "btc_price": None,
+        "btc_change_1h_pct": None,
+        "fear_greed": None,
+        "fear_greed_label": None,
+        "funding_rate": None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    import asyncio
+
+    async def _get_btc() -> None:
+        # Try Coinbase first (public, no geo-block)
+        try:
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=5.0) as c:
+                r = await c.get(
+                    "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                    params={"granularity": 60, "limit": 62},
+                )
+                r.raise_for_status()
+                rows = r.json()  # [[time, low, high, open, close, volume], ...]
+                if rows and len(rows) >= 2:
+                    rows_sorted = sorted(rows, key=lambda x: x[0])
+                    result["btc_price"] = float(rows_sorted[-1][4])
+                    if len(rows_sorted) >= 62:
+                        result["btc_change_1h_pct"] = round(
+                            (rows_sorted[-1][4] / rows_sorted[-62][4] - 1) * 100, 2
+                        )
+                    return
+        except Exception:
+            pass
+        # Fallback: ccxt via thread
+        try:
+            def _ccxt_fetch():
+                from data.collector_binance import fetch_ohlcv
+                df = fetch_ohlcv(limit=62)
+                return df
+            df = await asyncio.to_thread(_ccxt_fetch)
+            if df is not None and not df.empty:
+                result["btc_price"] = float(df["close"].iloc[-1])
+                if len(df) >= 62:
+                    result["btc_change_1h_pct"] = round(
+                        (float(df["close"].iloc[-1]) / float(df["close"].iloc[-62]) - 1) * 100, 2
+                    )
+        except Exception:
+            pass
+
+    async def _get_sentiment() -> None:
+        try:
+            def _fetch():
+                from data.sentiment_collector import fetch_all_sentiment
+                return fetch_all_sentiment()
+            snap = await asyncio.to_thread(_fetch)
+            if snap and snap.fear_greed:
+                result["fear_greed"] = snap.fear_greed.value
+                result["fear_greed_label"] = snap.fear_greed.label
+            if snap and snap.funding_rate:
+                result["funding_rate"] = snap.funding_rate.funding_rate
+        except Exception:
+            pass
+
+    await asyncio.gather(_get_btc(), _get_sentiment())
+
+    _ticker_cache = result
+    _ticker_cache_ts = _time.monotonic()
+    return result
+
+
+@app.get("/api/sentiment")
+async def api_sentiment():
+    """Full sentiment snapshot: Fear & Greed, funding, OI change, headlines."""
+    try:
+        from paper_trading.engine import PaperEngine
+        engine = PaperEngine()
+        snap = engine.get_sentiment_snapshot()
+        return snap
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+@app.get("/api/learn")
+async def api_learn():
+    """Adaptive learning report (same as Telegram /learn)."""
+    try:
+        from paper_trading.learner import Learner
+        learner = Learner()
+        return {"report": learner.build_report()}
+    except Exception as e:
+        return {"report": "", "error": str(e)}
+
+
+@app.get("/api/wallets")
+async def api_wallets():
+    """Whale wallet analysis report."""
+    try:
+        from data.wallet_tracker import WalletTracker
+        tracker = WalletTracker()
+        return {"report": tracker.build_report()}
+    except Exception as e:
+        return {"report": f"Wallet report unavailable: {e}", "error": str(e)}
+
+
+@app.get("/api/live-check")
+async def api_live_check():
+    """Live trading readiness check (same as Telegram /live_check)."""
+    try:
+        from wallets.agentkit_base import live_trading_readiness_check, get_all_balances
+        checks = live_trading_readiness_check()
+        balances = get_all_balances()
+        return {"checks": checks, "balances": balances}
+    except Exception as e:
+        return {"checks": None, "balances": {"error": str(e)}, "error": str(e)}
+
+
+_crypto_prices_cache: dict = {}
+_crypto_prices_ts: float = 0.0
+_CRYPTO_TTL = 8.0
+
+
+@app.get("/api/crypto-prices")
+async def api_crypto_prices():
+    """Live prices for BTC, ETH, SOL. CoinGecko first, Binance fallback."""
+    global _crypto_prices_cache, _crypto_prices_ts
+    now = _time.monotonic()
+    if _crypto_prices_cache and now - _crypto_prices_ts < _CRYPTO_TTL:
+        return _crypto_prices_cache
+    result = {"btc": None, "eth": None, "sol": None}
+    import httpx
+    # 1) CoinGecko (free, no key for basic)
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "bitcoin,ethereum,solana", "vs_currencies": "usd", "include_24hr_change": "true"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            for key, coin_id in [("btc", "bitcoin"), ("eth", "ethereum"), ("sol", "solana")]:
+                if coin_id in data:
+                    result[key] = {
+                        "price": data[coin_id].get("usd"),
+                        "change_24h": data[coin_id].get("usd_24h_change"),
+                    }
+            if any(result[k] and result[k].get("price") for k in result):
+                _crypto_prices_cache = result
+                _crypto_prices_ts = now
+                return result
+    except Exception:
+        pass
+    # 2) Binance fallback
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            for sym, key in [("BTCUSDT", "btc"), ("ETHUSDT", "eth"), ("SOLUSDT", "sol")]:
+                r = await c.get(f"https://api.binance.com/api/v3/ticker/24hr", params={"symbol": sym})
+                if r.status_code == 200:
+                    d = r.json()
+                    result[key] = {
+                        "price": float(d.get("lastPrice", 0)),
+                        "change_24h": float(d.get("priceChangePercent", 0)),
+                    }
+    except Exception:
+        pass
+    _crypto_prices_cache = result
+    _crypto_prices_ts = now
+    return result
+
+
+@app.post("/api/find-markets")
+async def api_find_markets():
+    """Run find_btc_markets script (same as Telegram /find_markets)."""
+    import subprocess
+    import sys
+    try:
+        result = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "scripts" / "find_btc_markets.py"), "--5min-only"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        cfg_path = PROJECT_ROOT / "config" / "btc_markets.json"
+        n = 0
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                data = json.load(f)
+            n = len(data) if isinstance(data, list) else 0
+        return {
+            "ok": result.returncode == 0,
+            "n_markets": n,
+            "stdout": (result.stdout or "")[-500:],
+            "stderr": (result.stderr or "")[-300:],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/performance")
+async def api_performance():
+    """Key performance metrics: Sharpe, Brier score, max drawdown, avg edge."""
+    from paper_trading import persistence as db
+    import numpy as np
+    db.init_db()
+    closed = db.get_all_closed_trades()
+    if not closed:
+        return {"n": 0, "sharpe": 0, "brier": 0.25, "max_dd": 0, "avg_edge": 0, "avg_pnl": 0}
+
+    pnls = [t["pnl"] for t in closed if t.get("pnl") is not None]
+    probs = [(t["model_prob"], 1.0 if t["status"] == "won" else 0.0)
+             for t in closed if t.get("model_prob") is not None]
+
+    brier = float(np.mean([(p - a) ** 2 for p, a in probs])) if probs else 0.25
+    avg_pnl = float(np.mean(pnls)) if pnls else 0.0
+    avg_edge = float(np.mean([t["edge"] for t in closed if t.get("edge") is not None])) if closed else 0.0
+
+    sharpe = 0.0
+    if len(pnls) >= 2:
+        arr = np.array(pnls)
+        std = float(np.std(arr))
+        if std > 0:
+            sharpe = round(float(np.mean(arr)) / std, 3)
+
+    # Max drawdown
+    max_dd = 0.0
+    running_pnl, peak = 0.0, 0.0
+    for pnl in pnls:
+        running_pnl += pnl
+        if running_pnl > peak:
+            peak = running_pnl
+        if peak > 0:
+            dd = (peak - running_pnl) / peak
+            max_dd = max(max_dd, dd)
+
+    return {
+        "n": len(closed),
+        "sharpe": round(sharpe, 3),
+        "brier": round(brier, 4),
+        "max_dd": round(max_dd, 4),
+        "avg_edge": round(avg_edge, 4),
+        "avg_pnl": round(avg_pnl, 4),
+    }

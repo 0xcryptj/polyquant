@@ -30,7 +30,6 @@ from paper_trading import persistence as db
 from paper_trading.utils import age_seconds
 from control.kill_switch import KillSwitch
 from models.ev_filter import evaluate_trade, TradeSignal
-from models.kelly_sizer import size_position
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +77,16 @@ class PaperEngine:
         self._pipeline: Any = None          # sklearn pipeline (loaded lazily)
         self._last_ohlcv: Any = None        # cached DataFrame
         self._market_config: list[dict]  = self._load_market_config_full()
-        self._active_token_ids: list[str] = [m["token_id"] for m in self._market_config]
+        # Prefer 5-min markets only — fall back to SIM when none (ensures 5m UP/DOWN trading)
+        self._active_token_ids: list[str] = [
+            m["token_id"] for m in self._market_config
+            if (m.get("market_type") or "").lower() == "5min"
+        ]
+        if self._market_config and not self._active_token_ids:
+            logger.info(
+                "Markets config has %d entries but no 5-min — using SIMULATION MODE for 5m UP/DOWN",
+                len(self._market_config),
+            )
         self._market_meta: dict[str, dict] = {m["token_id"]: m for m in self._market_config}
 
         # LLM reasoning engine (optional — requires ANTHROPIC_API_KEY)
@@ -98,7 +106,7 @@ class PaperEngine:
 
     def run_cycle(self) -> list[dict[str, Any]]:
         """
-        Execute one full trading cycle (call this every ~60 s from the bot).
+        Execute one full trading cycle (call this every ~45 s from the bot).
 
         Returns:
             List of event dicts describing what happened:
@@ -106,6 +114,7 @@ class PaperEngine:
               {'type': 'trade_resolved', ...}
               {'type': 'kill_switch', ...}
         """
+        _cycle_start = time.monotonic()
         events: list[dict[str, Any]] = []
 
         if self.kill_switch.is_triggered():
@@ -143,7 +152,8 @@ class PaperEngine:
         # 5. Evaluate signals for each active market (or simulate if none configured)
         import httpx
         open_count = len(db.get_open_trades())
-        max_open = 3
+        # More positions in SIM mode to accumulate data for learning
+        max_open = 8 if not self._active_token_ids else 5
 
         if open_count >= max_open:
             logger.debug("Max open positions (%d) reached — skipping signal eval", max_open)
@@ -151,7 +161,7 @@ class PaperEngine:
 
         if self._active_token_ids:
             # Real Polymarket markets available — use live order books
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=6.0) as client:
                 for token_id in self._active_token_ids:
                     if open_count >= max_open:
                         break
@@ -173,17 +183,39 @@ class PaperEngine:
             if sim_event:
                 events.append(sim_event)
 
+        elapsed = time.monotonic() - _cycle_start
+        opened  = sum(1 for e in events if e.get("type") == "trade_opened")
+        resolved = sum(1 for e in events if e.get("type") == "trade_resolved")
+        logger.info(
+            "Cycle done in %.1fs | opened=%d resolved=%d balance=%.2f open_pos=%d BTC=$%.0f",
+            elapsed, opened, resolved, self.balance, open_count, btc_price,
+        )
         return events
 
     def get_status(self) -> dict[str, Any]:
         """Return a status snapshot for Telegram /status command."""
         counts = db.get_trade_count()
+        daily = db.get_daily_trade_stats()
         closed = db.get_all_closed_trades()
         all_time_pnl = sum(t["pnl"] for t in closed if t["pnl"] is not None)
         open_trades = db.get_open_trades()
         locked = sum(float(t.get("size_usdc") or 0) for t in open_trades)
         total_equity = self.balance + locked
         total_pnl = total_equity - self.starting_balance
+
+        garch_vol: float | None = None
+        garch_regime: str = "—"
+        if self._last_ohlcv is not None and len(self._last_ohlcv) >= 60:
+            try:
+                import numpy as np
+                close = self._last_ohlcv["close"].astype(float)
+                log_ret = np.log(close / close.shift(1)).dropna()
+                vol_1h = float(log_ret.tail(60).std() * (525_600 ** 0.5))  # annualized
+                garch_vol = round(vol_1h, 3)
+                garch_regime = "high" if vol_1h > 0.8 else "normal"
+            except Exception:
+                pass
+
         return {
             "balance": self.balance,
             "starting_balance": self.starting_balance,
@@ -192,6 +224,10 @@ class PaperEngine:
             "return_pct": 100 * (total_equity / self.starting_balance - 1) if self.starting_balance else 0,
             "total_pnl": total_pnl,
             "all_time_pnl": all_time_pnl,
+            "daily_pnl": daily["daily_pnl"],
+            "trades_today": daily["trades_today"],
+            "garch_vol": garch_vol,
+            "garch_regime": garch_regime,
             "n_open": counts["open"],
             "n_wins": counts["wins"],
             "n_losses": counts["losses"],
@@ -203,6 +239,19 @@ class PaperEngine:
 
     def get_open_positions(self) -> list[dict[str, Any]]:
         return db.get_open_trades()
+
+    def get_open_positions_for_display(self) -> list[dict[str, Any]]:
+        """Open positions still within their hold window (excludes expired-but-not-yet-resolved)."""
+        now = datetime.now(timezone.utc)
+        open_trades = db.get_open_trades()
+        out = []
+        for t in open_trades:
+            age = age_seconds(t["opened_at"], now)
+            is_sim = (t.get("token_id") or "").startswith("SIM-")
+            hold = (TRADE_HOLD_SECONDS_5MIN + RESOLUTION_BUFFER_5MIN) if is_sim else TRADE_HOLD_SECONDS_REAL
+            if age <= hold:
+                out.append(t)
+        return out
 
     def get_recent_trades(self, n: int = 10) -> list[dict[str, Any]]:
         return db.get_recent_trades(n)
@@ -335,22 +384,13 @@ class PaperEngine:
             logger.debug("No signal for %s: %s", token_id[:12], signal.reason)
             return None
 
-        # Size position (use final_prob — same probability that triggered the trade)
-        kelly = db.get_param("kelly_fraction", settings.kelly_fraction)
-        size_usdc = size_position(
-            prob_win=final_prob,
-            cost_per_share=signal.market_price,
-            bankroll_usdc=self.balance,
-            kelly_multiplier=kelly,
-            max_usdc=settings.max_position_usdc,
-        )
+        # Fixed 5% of total equity per order
+        total_equity = self.balance + sum(float(t.get("size_usdc") or 0) for t in db.get_open_trades())
+        size_usdc = max(1.0, min(self.balance * 0.99, total_equity * 0.05))
 
         if size_usdc < 1.0:
             logger.debug("Position too small (%.2f USDC) — skipping", size_usdc)
             return None
-
-        if size_usdc > self.balance:
-            size_usdc = self.balance * 0.1  # safety: never bet more than available
 
         # Whale alignment veto — if whales strongly oppose, skip before any DB changes
         whale_alignment = "NEUTRAL"
@@ -382,6 +422,12 @@ class PaperEngine:
             features=features,
         )
         self.balance = new_balance
+        db.log_trade_open(
+            trade_id=trade_id, order_id=order_id, token_id=token_id,
+            direction=signal.direction, entry_price=signal.market_price,
+            size_usdc=size_usdc, shares=shares, btc_price_entry=btc_price,
+            model_prob=final_prob, edge=signal.edge, simulated=False,
+        )
 
         # Sentiment context
         sentiment_score = None
@@ -448,9 +494,15 @@ class PaperEngine:
                 hold = TRADE_HOLD_SECONDS_5MIN + RESOLUTION_BUFFER_5MIN
                 if age < hold:
                     continue
-                if btc_now is None:
-                    continue
-                event = self._resolve_btc_direction(trade, btc_now)
+                if btc_now is not None:
+                    event = self._resolve_btc_direction(trade, btc_now)
+                else:
+                    # No current BTC price — resolve at entry (PnL ≈ 0) so position doesn't stick forever
+                    event = self._resolve_at_price(
+                        trade,
+                        exit_price=trade["entry_price"],
+                        btc_exit=trade["btc_price_entry"],
+                    )
             else:
                 # Real: try mark-to-market first, fall back to BTC direction
                 hold = TRADE_HOLD_SECONDS_REAL
@@ -534,6 +586,7 @@ class PaperEngine:
 
         returned = size_usdc + pnl
         new_balance = self.balance + returned
+        now_resolved = datetime.now(timezone.utc).isoformat()
         db.resolve_trade_and_set_balance(
             trade_id=trade["id"],
             btc_price_exit=btc_exit or trade["btc_price_entry"],
@@ -544,6 +597,14 @@ class PaperEngine:
         )
         self.balance = new_balance
         self.kill_switch.update(self.balance)
+        db.log_trade_resolve(
+            trade_id=trade["id"], token_id=trade["token_id"],
+            direction=direction, status=status,
+            entry_price=entry_price, exit_price=exit_price, pnl=pnl,
+            btc_price_entry=trade["btc_price_entry"],
+            btc_price_exit=btc_exit or trade["btc_price_entry"],
+            size_usdc=size_usdc, resolved_at=now_resolved,
+        )
 
         logger.info(
             "TRADE RESOLVED #%d | %s | %s | entry=%.4f exit=%.4f | "
@@ -720,24 +781,30 @@ class PaperEngine:
         import hashlib
         from datetime import datetime, timezone
 
-        # One simulated trade per 5-min window
+        # Up to 2 simulated trades per 5-min window for more order flow
         now = datetime.now(timezone.utc)
         window = int(now.timestamp()) // 300   # 5-min epoch
-        sim_token = f"SIM-{window:x}"
-
-        # Don't re-enter the same window
+        window_prefix = f"SIM-{window:x}"
         open_trades = db.get_open_trades()
-        if any(t["token_id"] == sim_token for t in open_trades):
+        window_count = sum(1 for t in open_trades if (t.get("token_id") or "").startswith(window_prefix + "-") or t.get("token_id") == window_prefix)
+        if window_count >= 2:
             return None
+        sim_token = f"{window_prefix}-{window_count}"
 
-        # Simulated market price: approximately 0.50 ± noise (random walk)
+        # Simulated market price: use BTC 5m momentum (mom_5m) for realistic tilt
+        # Positive momentum -> Yes more expensive; negative -> No more expensive
+        mom_5m = float(features.get("mom_5m", 0.0) or 0.0)
+        momentum_tilt = float(np.clip(mom_5m * 3.0, -0.12, 0.12))
         import random
         rng = random.Random(window)
-        market_noise = rng.uniform(-0.08, 0.08)
-        sim_ask = max(0.35, min(0.65, 0.50 + market_noise))
+        market_noise = rng.uniform(-0.04, 0.04)
+        base = 0.50 + momentum_tilt + market_noise
+        sim_ask = max(0.35, min(0.65, base))
         sim_bid = sim_ask - 0.02   # 2-cent spread
 
         min_edge = db.get_param("min_edge", settings.min_edge_threshold)
+        # In SIM, accept slightly negative EV to ensure constant 5m order flow for learning
+        min_edge_sim = min(min_edge, -0.02)
         max_spread = db.get_param("max_spread", settings.max_spread)
 
         from models.ev_filter import evaluate_trade
@@ -746,7 +813,7 @@ class PaperEngine:
             model_prob=model_prob,
             best_ask=sim_ask,
             best_bid=sim_bid,
-            min_edge=min_edge,
+            min_edge=min_edge_sim,
             max_spread=max_spread,
         )
 
@@ -755,15 +822,9 @@ class PaperEngine:
                          model_prob, sim_ask, signal.edge)
             return None
 
-        kelly = db.get_param("kelly_fraction", settings.kelly_fraction)
-        from models.kelly_sizer import size_position
-        size_usdc = size_position(
-            prob_win=model_prob,
-            cost_per_share=signal.market_price,
-            bankroll_usdc=self.balance,
-            kelly_multiplier=kelly,
-            max_usdc=settings.max_position_usdc,
-        )
+        # Fixed 5% of total equity per order
+        total_equity = self.balance + sum(float(t.get("size_usdc") or 0) for t in open_trades)
+        size_usdc = max(1.0, min(self.balance * 0.99, total_equity * 0.05))
 
         if size_usdc < 1.0 or size_usdc > self.balance:
             return None
@@ -786,6 +847,12 @@ class PaperEngine:
 
         self.balance -= size_usdc
         db.set_balance(self.balance)
+        db.log_trade_open(
+            trade_id=trade_id, order_id=order_id, token_id=sim_token,
+            direction=signal.direction, entry_price=signal.market_price,
+            size_usdc=size_usdc, shares=shares, btc_price_entry=btc_price,
+            model_prob=model_prob, edge=signal.edge, simulated=True,
+        )
 
         # Sentiment context
         sentiment_score = None

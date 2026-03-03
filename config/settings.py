@@ -52,7 +52,11 @@ class Settings(BaseSettings):
     polymarket_api_passphrase: SecretStr = Field(default="", description="Polymarket CLOB passphrase")
     polymarket_clob_host: str = Field(
         default="https://clob.polymarket.com",
-        description="CLOB API base URL",
+        description="Polymarket CLOB API base URL",
+    )
+    polymarket_gamma_host: str = Field(
+        default="https://gamma-api.polymarket.com",
+        description="Polymarket Gamma API base URL (market discovery)",
     )
 
     # ── Wallet ───────────────────────────────────────────────────────────────
@@ -86,6 +90,18 @@ class Settings(BaseSettings):
     binance_base_url: str = Field(
         default="https://api.binance.com",
         description="Binance REST API base URL",
+    )
+    coinbase_exchange_url: str = Field(
+        default="https://api.exchange.coinbase.com",
+        description="Coinbase Exchange public REST API (no key required)",
+    )
+    coingecko_base_url: str = Field(
+        default="https://api.coingecko.com",
+        description="CoinGecko API base URL",
+    )
+    coingecko_api_key: str = Field(
+        default="",
+        description="CoinGecko Demo API key (optional, increases rate limits)",
     )
     btc_symbol: str = Field(default="BTC/USDT", description="ccxt symbol for BTC")
     candle_interval: str = Field(default="1m", description="ccxt OHLCV interval")
@@ -152,6 +168,7 @@ class Settings(BaseSettings):
     def safe_summary(self) -> dict:
         return {
             "polymarket_clob_host": self.polymarket_clob_host,
+            "polymarket_gamma_host": self.polymarket_gamma_host,
             "polymarket_api_key": (self.polymarket_api_key[:8] + "...") if self.polymarket_api_key else "(not set)",
             "wallet_address": self.wallet_address,
             "paper_trading": self.paper_trading,

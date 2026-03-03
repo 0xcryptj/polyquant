@@ -4,6 +4,9 @@ Entry point — PolyQuant paper trading Telegram bot.
 Usage:
     python bot/main.py
 
+Trading, data refresh, and the web dashboard start immediately on launch.
+Open http://localhost:8080 in your browser once the bot is running.
+
 Quick-start guide:
   1. Copy .env.example → .env and fill in:
        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (required for bot)
@@ -22,10 +25,65 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def _kill_existing_instance(pid_file: Path, logger: "logging.Logger") -> None:
+    """
+    If another bot process is running (tracked by pid_file), kill it before
+    we start so there's no Telegram 409 Conflict.  Safe to call even if no
+    previous instance exists.
+    """
+    if not pid_file.exists():
+        return
+    try:
+        old_pid = int(pid_file.read_text().strip())
+    except Exception:
+        pid_file.unlink(missing_ok=True)
+        return
+    if old_pid == os.getpid():
+        return  # Same process — shouldn't happen, but guard anyway
+
+    alive = False
+    try:
+        if sys.platform == "win32":
+            import subprocess as _sp
+            r = _sp.run(
+                ["tasklist", "/FI", f"PID eq {old_pid}", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=5,
+            )
+            alive = str(old_pid) in r.stdout
+        else:
+            os.kill(old_pid, 0)  # signal 0 = existence check only
+            alive = True
+    except (ProcessLookupError, PermissionError, OSError):
+        alive = False
+
+    if alive:
+        logger.warning(
+            "Found existing bot instance (PID %d) — killing it to avoid Telegram 409 Conflicts...",
+            old_pid,
+        )
+        try:
+            if sys.platform == "win32":
+                import subprocess as _sp
+                _sp.run(["taskkill", "/F", "/PID", str(old_pid)], capture_output=True, timeout=5)
+            else:
+                import signal as _signal
+                os.kill(old_pid, _signal.SIGTERM)
+            time.sleep(3)  # Let the old process fully exit
+            logger.info("Old instance terminated. Starting fresh.")
+        except Exception as exc:
+            logger.warning("Could not kill old instance (pid=%d): %s. Continuing anyway.", old_pid, exc)
+    else:
+        logger.debug("Stale PID file (pid=%d no longer running). Ignoring.", old_pid)
+
+    pid_file.unlink(missing_ok=True)
 
 
 def _setup_logging() -> None:
@@ -91,6 +149,13 @@ def main() -> None:
         sys.exit(1)
 
     logger.info("Settings loaded: %s", settings.safe_summary())
+
+    # ── Instance lock: kill any previous bot process to avoid Telegram 409s ──
+    from config.settings import PROJECT_ROOT
+    pid_file = PROJECT_ROOT / "paper_trading" / "bot.pid"
+    _kill_existing_instance(pid_file, logger)
+    pid_file.write_text(str(os.getpid()))
+
     has_markets, market_status = _check_markets()
     engine  = PaperEngine(starting_balance=STARTING_PAPER_BALANCE)
     model_status = _check_model(engine)
@@ -98,31 +163,10 @@ def main() -> None:
     learner = Learner()
     bot     = TelegramBot(engine=engine, learner=learner)
 
-    # ── Queue startup notification ────────────────────────────────────────
-    # The job queue sends it ~5 s after polling starts so the bot is ready
-    async def _startup_notification(ctx) -> None:
-        s = engine.get_status()
-        market_icon = "📡" if has_markets else "🔬"
-        mode_str = "Real Markets" if has_markets else "Simulation"
-
-        text = (
-            f"🚀 *PolyQuant Bot Started*\n\n"
-            f"_Paper-trading simulations. Claude learns from results._\n\n"
-            f"💰 Bankroll: ${s['balance']:.2f}\n"
-            f"{market_icon} {mode_str}\n"
-            f"  {market_status}\n"
-            f"🧠 {model_status}\n\n"
-            f"📋 Trades: {s['n_total']} · {s['n_wins']} wins / {s['n_losses']} losses\n"
-            f"   Open: {s['n_open']} · Total profit: ${s['total_pnl']:+.2f}\n\n"
-            f"⚙️ Loop: every 60 s · Trades close in ~5 min\n\n"
-            f"Tip: Run only *one* bot instance to avoid balance mix-ups."
-        )
-        await bot._notify(text, reply_markup=MAIN_KEYBOARD)
-
-    bot.app.job_queue.run_once(_startup_notification, when=5)
-
-    # ── Run ───────────────────────────────────────────────────────────────
-    logger.info("Starting Telegram bot (chat=%s)...", settings.telegram_chat_id)
+    logger.info(
+        "Starting PolyQuant bot (chat=%s) — trading starts automatically. Web dashboard at http://localhost:8080",
+        settings.telegram_chat_id,
+    )
     try:
         bot.run()
     except KeyboardInterrupt:
@@ -130,6 +174,8 @@ def main() -> None:
     except Exception as exc:
         logger.critical("Bot crashed: %s", exc, exc_info=True)
         sys.exit(1)
+    finally:
+        pid_file.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

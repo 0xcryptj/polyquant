@@ -26,8 +26,8 @@ from paper_trading import persistence as db
 
 logger = logging.getLogger(__name__)
 
-# Trigger a learning pass after this many new closed trades
-LEARN_EVERY = 5
+# Trigger a learning pass after this many new closed trades (adapt more frequently)
+LEARN_EVERY = 4
 
 # Rolling window for win-rate computation
 ROLLING_WINDOW = 20

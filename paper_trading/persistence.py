@@ -314,6 +314,88 @@ def get_trade_count() -> dict[str, int]:
     return dict(row) if row else {"total": 0, "wins": 0, "losses": 0, "open": 0}
 
 
+def get_dashboard_data(n_closed: int = 25) -> dict:
+    """Batch fetch for dashboard: balance, counts, open trades, recent closed. Fewer round-trips."""
+    conn = get_conn()
+    bal = conn.execute(
+        "SELECT usdc, COALESCE(starting_usdc, usdc, 1000.0) as starting_usdc FROM balance WHERE id = 1"
+    ).fetchone()
+    balance = float(bal["usdc"]) if bal else 1000.0
+    starting = float(bal["starting_usdc"]) if bal else 1000.0
+
+    counts = conn.execute(
+        """SELECT COUNT(*) as total,
+                  COALESCE(SUM(CASE WHEN status='won' THEN 1 ELSE 0 END), 0) as wins,
+                  COALESCE(SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END), 0) as losses,
+                  COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) as open
+           FROM trades"""
+    ).fetchone()
+    counts = dict(counts) if counts else {"total": 0, "wins": 0, "losses": 0, "open": 0}
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    daily = conn.execute(
+        """SELECT COUNT(*) as n, COALESCE(SUM(pnl), 0) as pnl FROM trades
+           WHERE status IN ('won','lost') AND resolved_at IS NOT NULL AND date(resolved_at)=?""",
+        (today,),
+    ).fetchone()
+    trades_today = int(daily["n"]) if daily else 0
+    daily_pnl = float(daily["pnl"]) if daily else 0.0
+
+    opens = [dict(r) for r in conn.execute(
+        "SELECT * FROM trades WHERE status='open' ORDER BY opened_at ASC"
+    ).fetchall()]
+    closed = [dict(r) for r in conn.execute(
+        "SELECT * FROM trades WHERE status != 'open' ORDER BY resolved_at DESC LIMIT ?",
+        (n_closed,),
+    ).fetchall()]
+
+    pnl_row = conn.execute(
+        "SELECT COALESCE(SUM(pnl), 0) as s FROM trades WHERE status IN ('won', 'lost')"
+    ).fetchone()
+    all_time_pnl = float(pnl_row["s"]) if pnl_row else 0.0
+
+    locked = sum(float(t.get("size_usdc") or 0) for t in opens)
+    total_equity = balance + locked
+    total_pnl = total_equity - starting
+    wr = (counts["wins"] or 0) / max((counts["wins"] or 0) + (counts["losses"] or 0), 1)
+    return {
+        "balance": balance,
+        "starting_balance": starting,
+        "locked_in_positions": locked,
+        "total_equity": total_equity,
+        "return_pct": 100 * (total_equity / starting - 1) if starting else 0,
+        "total_pnl": total_pnl,
+        "all_time_pnl": all_time_pnl,
+        "n_open": counts["open"],
+        "n_wins": counts["wins"],
+        "n_losses": counts["losses"],
+        "n_total": counts["total"],
+        "win_rate": wr,
+        "daily_pnl": daily_pnl,
+        "trades_today": trades_today,
+        "opens": opens,
+        "closed": closed,
+    }
+
+
+def get_daily_trade_stats() -> dict[str, float | int]:
+    """Return trades_today (count) and daily_pnl (sum of pnl for trades resolved today UTC)."""
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    row = get_conn().execute(
+        """SELECT
+               COUNT(*) as trades_today,
+               COALESCE(SUM(pnl), 0) as daily_pnl
+           FROM trades
+           WHERE status IN ('won', 'lost')
+             AND resolved_at IS NOT NULL
+             AND date(resolved_at) = ?""",
+        (today_utc,),
+    ).fetchone()
+    if not row:
+        return {"trades_today": 0, "daily_pnl": 0.0}
+    return {"trades_today": int(row["trades_today"]), "daily_pnl": float(row["daily_pnl"])}
+
+
 # ── Adaptive Parameters ───────────────────────────────────────────────────────
 
 def get_param(key: str, default: float) -> float:
@@ -366,6 +448,83 @@ def get_recent_snapshots(n: int = 10) -> list[dict[str, Any]]:
         "SELECT * FROM learning_snapshots ORDER BY snapshot_at DESC LIMIT ?", (n,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Trade Log (audit trail) ───────────────────────────────────────────────────
+
+TRADE_LOG_PATH = DB_PATH.parent / "trade_log.jsonl"
+
+
+def log_trade_open(
+    trade_id: int,
+    order_id: str,
+    token_id: str,
+    direction: str,
+    entry_price: float,
+    size_usdc: float,
+    shares: float,
+    btc_price_entry: float,
+    model_prob: float,
+    edge: float,
+    simulated: bool = False,
+) -> None:
+    """Append trade-open event to audit log (JSONL)."""
+    try:
+        record = {
+            "event": "open",
+            "trade_id": trade_id,
+            "order_id": order_id,
+            "token_id": token_id,
+            "direction": direction,
+            "entry_price": entry_price,
+            "size_usdc": size_usdc,
+            "shares": shares,
+            "btc_price_entry": btc_price_entry,
+            "model_prob": model_prob,
+            "edge": edge,
+            "simulated": simulated,
+            "timestamp": _now(),
+        }
+        with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass  # best-effort, don't fail trade on log write
+
+
+def log_trade_resolve(
+    trade_id: int,
+    token_id: str,
+    direction: str,
+    status: str,
+    entry_price: float,
+    exit_price: float,
+    pnl: float,
+    btc_price_entry: float,
+    btc_price_exit: float,
+    size_usdc: float,
+    resolved_at: str,
+) -> None:
+    """Append trade-resolve event with outcome to audit log (JSONL)."""
+    try:
+        record = {
+            "event": "resolve",
+            "trade_id": trade_id,
+            "token_id": token_id,
+            "direction": direction,
+            "status": status,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "btc_price_entry": btc_price_entry,
+            "btc_price_exit": btc_price_exit,
+            "size_usdc": size_usdc,
+            "resolved_at": resolved_at,
+            "timestamp": _now(),
+        }
+        with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass  # best-effort
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

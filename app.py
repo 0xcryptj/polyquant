@@ -44,7 +44,7 @@ Provider examples:
     p.add_argument("--log-json", action="store_true",
                    help="Output structured JSON logs (recommended in production)")
     p.add_argument("--wallet-provider",
-                   choices=["sdk", "agentic", "none"], default=None,
+                   choices=["sdk", "agentic", "awal", "mock", "none"], default=None,
                    help="Wallet backend (overrides WALLET_PROVIDER in .env)")
     p.add_argument("--execution-provider",
                    choices=["clob", "cli"], default=None,

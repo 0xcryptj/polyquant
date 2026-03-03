@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# PolyQuant management script — up, down, restart, logs, status, doctor
+# Usage: ./scripts/polyquant up | down | restart | logs | status | doctor
+
+set -e
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+PID_FILE="${ROOT}/artifacts/runtime.pid"
+LOG_FILE="${ROOT}/artifacts/logs/runtime.log"
+
+cmd_up() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "Already running (PID $pid)"
+      return 0
+    fi
+  fi
+  mkdir -p "$(dirname "$LOG_FILE")"
+  nohup python app.py >> "$LOG_FILE" 2>&1 &
+  echo "$!" > "$PID_FILE"
+  echo "Started (PID $(cat "$PID_FILE"))"
+}
+
+cmd_down() {
+  if [ ! -f "$PID_FILE" ]; then
+    echo "Not running (no PID file)"
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PID_FILE")
+  if [ -z "$pid" ]; then
+    echo "Not running"
+    return 0
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    echo "Stopped (PID $pid)"
+  else
+    echo "Process $pid not running"
+  fi
+  rm -f "$PID_FILE"
+}
+
+cmd_restart() {
+  cmd_down
+  sleep 2
+  cmd_up
+}
+
+cmd_logs() {
+  if [ -f "$LOG_FILE" ]; then
+    tail -f "$LOG_FILE"
+  else
+    echo "No log file yet: $LOG_FILE"
+  fi
+}
+
+cmd_status() {
+  if [ ! -f "$PID_FILE" ]; then
+    echo "Status: not running"
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PID_FILE")
+  if [ -z "$pid" ]; then
+    echo "Status: not running"
+    return 0
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Status: running (PID $pid)"
+  else
+    echo "Status: not running (stale PID $pid)"
+    rm -f "$PID_FILE"
+  fi
+}
+
+cmd_doctor() {
+  python -m wallets.doctor_awal
+}
+
+case "${1:-}" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  restart) cmd_restart ;;
+  logs)   cmd_logs ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  *)
+    echo "Usage: $0 {up|down|restart|logs|status|doctor}"
+    exit 1
+    ;;
+esac

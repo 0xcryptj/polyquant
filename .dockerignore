@@ -1,0 +1,17 @@
+.env
+.git
+.gitignore
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.log
+*.pid
+web/
+backtest/
+tests/
+requirements-dev.txt
+paper_trading/bot.log
+paper_trading/paper_trades.db

@@ -1,9 +1,9 @@
 """
 Telegram Bot — PolyGun-style signal alerts + adaptive learning commands.
 
-Start flow: Run `python bot/main.py`. Trading, sentiment refresh, wallet
-updates, and the web dashboard all start automatically — no /start needed.
-Use ⏸ Pause / ▶️ Resume buttons to stop and restart trading + the web server.
+Start flow: Run `python bot/main.py`. Trading, sentiment refresh, and wallet
+updates start automatically — no /start needed.
+Use ⏸ Pause / ▶️ Resume buttons to stop and restart trading.
 
 Performance design:
   - ALL blocking work (DB, HTTP, engine cycle) runs in asyncio.to_thread()
@@ -13,32 +13,39 @@ Performance design:
   - Trading loop is fully offloaded to thread pool; it never touches event loop
 
 Commands:
-  /start       — greeting + current status (trading already running)
-  /help        — command reference
-  /status      — balance, PnL, open positions, loop state
-  /positions   — open paper positions
-  /trades [n]  — last n resolved trades (default 10)
-  /performance — win rate, Sharpe, Brier, drawdown
-  /learn       — adaptive learning report + parameter changes
-  /params      — current trading parameters
-  /sentiment   — Fear & Greed, funding rate, news (cached, instant)
-  /wallets     — whale wallet analysis (cached, instant)
-  /live_check  — readiness check for transitioning to live trading
-  /reset       — reset paper balance (confirmation required)
-  /webui       — start/stop/open Web dashboard (http://localhost:8080)
+  /start        — greeting + current status (trading already running)
+  /help         — command reference
+  /status       — balance, PnL, open positions, uptime, last error
+  /health       — quick system health check
+  /config       — show current settings (secrets redacted)
+  /restart_safe — gracefully pause then resume trading
+  /positions    — open paper positions
+  /trades [n]   — last n resolved trades (default 10)
+  /performance  — win rate, Sharpe, Brier, drawdown
+  /learn        — adaptive learning report + parameter changes
+  /params       — current trading parameters
+  /sentiment    — Fear & Greed, funding rate, news (cached, instant)
+  /wallets      — whale wallet analysis (cached, instant)
+  /live_check   — readiness check for transitioning to live trading
+  /reset        — reset paper balance (confirmation required)
   /find_markets — discover BTC markets from Polymarket (saves to config)
-  /start_bot   — resume trading loop + web server
-  /stop_bot    — pause trading loop + stop web server
+  /start_bot    — resume trading loop
+  /stop_bot     — pause trading loop
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_BOT_VERSION = "1.1.0"
+_START_TIME: float = time.monotonic()
+_last_error: str = ""
 
 from telegram import (
     InlineKeyboardButton,
@@ -73,7 +80,7 @@ KEYBOARD_ROWS = [
     [KeyboardButton("📊 Status"), KeyboardButton("📋 Positions"), KeyboardButton("📈 Trades")],
     [KeyboardButton("📉 Performance"), KeyboardButton("🌡 Sentiment"), KeyboardButton("🧠 Learn")],
     [KeyboardButton("▶️ Resume"), KeyboardButton("⏸ Pause"), KeyboardButton("🔄 Reset")],
-    [KeyboardButton("🌐 Web UI"), KeyboardButton("🔧 Find Markets"), KeyboardButton("⚙ Params")],
+    [KeyboardButton("💊 Health"), KeyboardButton("🔧 Find Markets"), KeyboardButton("⚙ Params")],
 ]
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     KEYBOARD_ROWS,
@@ -84,14 +91,6 @@ SENTIMENT_TTL = 180         # seconds between sentiment refreshes (3 min — alw
 WALLET_TTL    = 300         # seconds between wallet analysis refreshes (5 min)
 
 _trading_active = True
-_web_ui_process = None  # subprocess.Popen for web server
-
-
-def _port_free(port: int) -> bool:
-    """Return True if nothing is bound to port on localhost."""
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("127.0.0.1", port)) != 0
 
 
 class TelegramBot:
@@ -144,11 +143,10 @@ class TelegramBot:
             await self.app.initialize()
             await self.app.start()
 
-            # Auto-start trading jobs and web server immediately — no /start needed
+            # Auto-start trading jobs immediately — no /start needed
             try:
                 await self._start_background()
-                self._start_web_ui()
-                logger.info("Bot polling started. Trading running. Web dashboard at http://localhost:8080")
+                logger.info("Bot polling started. Trading running.")
             except Exception as exc:
                 logger.error("Auto-start error (non-fatal, bot will still poll): %s", exc, exc_info=True)
 
@@ -218,57 +216,6 @@ class TelegramBot:
         jq.run_once(self._startup_notification_job, when=2)
         logger.info("Background started: trading loop, sentiment, wallets, daily summary")
 
-    def _start_web_ui(self) -> str:
-        """
-        Spawn a uvicorn subprocess for the web dashboard.
-        Returns one of: 'started', 'already_running', 'port_conflict', 'error:<msg>'.
-        Non-blocking — Popen returns immediately.
-        """
-        import subprocess
-        import sys
-
-        global _web_ui_process
-        if _web_ui_process is not None and _web_ui_process.poll() is None:
-            return "already_running"
-        if not _port_free(8080):
-            logger.warning("Port 8080 is already occupied — skipping web server start")
-            return "port_conflict"
-        try:
-            project_root = Path(__file__).resolve().parent.parent
-            _web_ui_process = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8080"],
-                cwd=str(project_root),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-            )
-            logger.info("Web UI started at http://localhost:8080 (pid=%s)", _web_ui_process.pid)
-            return "started"
-        except Exception as exc:
-            logger.error("Failed to start web UI: %s", exc)
-            return f"error:{exc}"
-
-    def _stop_web_ui(self) -> str:
-        """
-        Terminate the uvicorn subprocess.
-        Returns one of: 'stopped', 'not_running'.
-        """
-        global _web_ui_process
-        if _web_ui_process is None or _web_ui_process.poll() is not None:
-            _web_ui_process = None
-            return "not_running"
-        try:
-            _web_ui_process.terminate()
-            _web_ui_process.wait(timeout=5)
-        except Exception:
-            try:
-                _web_ui_process.kill()
-            except Exception:
-                pass
-        _web_ui_process = None
-        logger.info("Web UI stopped")
-        return "stopped"
-
     async def _startup_notification_job(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Send the startup summary once after background has started."""
         try:
@@ -314,7 +261,6 @@ class TelegramBot:
             f"👋 *PolyQuant is running.*\n\n"
             f"💰 Balance: ${s['balance']:.2f}  ·  Return: {s['return_pct']:+.1f}%\n"
             f"📋 {s['n_total']} trades  ·  {s['n_wins']}W / {s['n_losses']}L\n\n"
-            f"🌐 Dashboard: http://localhost:8080\n\n"
             f"Use the buttons below to monitor and control the bot."
         )
         await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
@@ -323,13 +269,14 @@ class TelegramBot:
         msg = update.message or update.effective_message
         text = (
             "*PolyQuant Paper Trading Bot*\n\n"
-            "Trading starts automatically on launch. Web dashboard: http://localhost:8080\n\n"
+            "Trading starts automatically on launch.\n\n"
             "Use the buttons below or type commands:\n\n"
             "📊 Status · Positions · Trades · Performance\n"
             "🌡 Sentiment · Learn · Params\n"
-            "▶️ Resume · ⏸ Pause · 🔄 Reset · 🌐 Web UI\n"
+            "▶️ Resume · ⏸ Pause · 🔄 Reset · 💊 Health\n"
             "🔧 Find Markets — discover BTC markets for trading\n\n"
-            "/wallets · /live_check — advanced commands"
+            "/health · /config · /restart\\_safe\n"
+            "/wallets · /live\\_check — advanced commands"
         )
         await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
 
@@ -347,7 +294,7 @@ class TelegramBot:
             "▶️ Resume": self._start_bot,
             "⏸ Pause": self._stop_bot,
             "🔄 Reset": self._reset_start,
-            "🌐 Web UI": self._web_ui_menu,
+            "💊 Health": self._health,
             "🔧 Find Markets": self._find_markets,
         }
         handler = mapping.get(text)
@@ -362,7 +309,7 @@ class TelegramBot:
 
     async def _status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s = await asyncio.to_thread(self.engine.get_status)
-        global _trading_active
+        global _trading_active, _last_error
 
         status_str = "RUNNING" if _trading_active else "PAUSED"
         mode_str = "PAPER" if settings.paper_trading else "LIVE"
@@ -373,18 +320,93 @@ class TelegramBot:
         garch_line = f"{garch_vol:.3f} ({garch_regime})" if garch_vol is not None else "—"
         kill_str = "triggered" if s["kill_switch"] else "armed"
 
+        elapsed = time.monotonic() - _START_TIME
+        hours, rem = divmod(int(elapsed), 3600)
+        mins = rem // 60
+        uptime_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+        err_str = f"`{_last_error[:120]}`" if _last_error else "none"
+
         text = (
-            f"*Status:* {status_str}\n"
-            f"*Mode:* {mode_str}\n"
+            f"*Status:* {status_str}  ·  *v{_BOT_VERSION}*\n"
+            f"*Mode:* {mode_str}  ·  *Uptime:* {uptime_str}\n"
             f"*Daily P&L:* {daily_pnl:+.2f} USDC\n"
             f"*Trades today:* {trades_today}\n"
             f"*GARCH vol:* {garch_line}\n"
             f"*Open positions:* {s['n_open']}\n"
             f"*Kill switch:* {kill_str}\n\n"
             f"💰 Balance: ${s['balance']:.2f}  ·  Return: {s['return_pct']:+.1f}%\n"
-            f"📋 Total: {s['n_total']} trades  ·  {s['n_wins']}W / {s['n_losses']}L  ·  {s['win_rate']:.0%} win rate"
+            f"📋 Total: {s['n_total']} trades  ·  {s['n_wins']}W / {s['n_losses']}L  ·  {s['win_rate']:.0%} win rate\n\n"
+            f"*Last error:* {err_str}"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def _health(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Quick health check: DB, engine, sentiment, kill-switch, uptime."""
+        msg = update.message or update.effective_message
+        global _trading_active, _last_error
+
+        def _check():
+            checks = {}
+            # DB reachable?
+            try:
+                db.get_all_closed_trades()
+                checks["db"] = True
+            except Exception as exc:
+                checks["db"] = False
+                checks["db_err"] = str(exc)[:60]
+            # Engine status
+            try:
+                s = self.engine.get_status()
+                checks["engine"] = True
+                checks["kill_switch"] = s.get("kill_switch", False)
+                checks["open_pos"] = s.get("n_open", 0)
+            except Exception as exc:
+                checks["engine"] = False
+                checks["engine_err"] = str(exc)[:60]
+            return checks
+
+        c = await asyncio.to_thread(_check)
+        yn = lambda v: "✅" if v else "❌"
+        elapsed = time.monotonic() - _START_TIME
+        hours, rem = divmod(int(elapsed), 3600)
+        uptime_str = f"{hours}h {rem // 60}m"
+
+        lines = [
+            f"💊 *Health Check*\n",
+            f"{yn(c.get('db'))} Database",
+            f"{yn(c.get('engine'))} Engine",
+            f"{yn(_trading_active)} Trading active",
+            f"{'🔴' if c.get('kill_switch') else '🟢'} Kill switch",
+            f"📊 Open positions: {c.get('open_pos', '?')}",
+            f"⏱ Uptime: {uptime_str}",
+        ]
+        if c.get("db_err"):
+            lines.append(f"  DB error: `{c['db_err']}`")
+        if c.get("engine_err"):
+            lines.append(f"  Engine error: `{c['engine_err']}`")
+        if _last_error:
+            lines.append(f"⚠️ Last error: `{_last_error[:120]}`")
+        await msg.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    async def _config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Display current settings with secrets redacted."""
+        msg = update.message or update.effective_message
+        summary = await asyncio.to_thread(settings.safe_summary)
+        lines = ["⚙️ *Config* _(secrets redacted)_\n"]
+        for k, v in summary.items():
+            lines.append(f"`{k}`: {v}")
+        await msg.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    async def _restart_safe(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Graceful restart: pause trading for 5s, then resume."""
+        msg = update.message or update.effective_message
+        global _trading_active
+        await msg.reply_text("🔄 Restarting trading loop safely…")
+        _trading_active = False
+        await asyncio.sleep(5)
+        _trading_active = True
+        logger.info("Safe restart completed via /restart_safe")
+        await msg.reply_text("✅ Trading loop restarted.")
 
     async def _positions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         positions = await asyncio.to_thread(self.engine.get_open_positions_for_display)
@@ -634,57 +656,6 @@ class TelegramBot:
         except Exception as exc:
             await msg.reply_text(f"❌ Find Markets failed: {exc}")
 
-    async def _web_ui_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Web UI controller: Start / Stop / Open. Also callable via /webui command."""
-        global _web_ui_process
-        is_running = _web_ui_process is not None and _web_ui_process.poll() is None
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Start Web UI", callback_data="webui_start")],
-            [InlineKeyboardButton("⏹ Stop Web UI", callback_data="webui_stop")],
-            [InlineKeyboardButton("🌐 Open http://localhost:8080", callback_data="webui_open")],
-        ])
-        status = "🟢 Running on http://localhost:8080" if is_running else "⚪ Stopped"
-        msg = update.message or update.effective_message
-        await msg.reply_text(
-            f"🌐 *Web UI Controller*\n\nStatus: {status}\n\n"
-            "Start: launches the dashboard\nStop: shuts it down\nOpen: link to dashboard",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard,
-        )
-
-    async def _web_ui_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle Web UI Start / Stop / Open callbacks."""
-        query = update.callback_query
-        await query.answer()
-
-        if query.data == "webui_start":
-            result = self._start_web_ui()
-            if result == "already_running":
-                await query.edit_message_text("🌐 Web UI is already running at http://localhost:8080")
-            elif result == "started":
-                await query.edit_message_text(
-                    "🌐 Web UI started at http://localhost:8080\n\nOpen in your browser."
-                )
-            elif result == "port_conflict":
-                await query.edit_message_text(
-                    "⚠️ Port 8080 is already occupied by another process.\n"
-                    "Stop the other process and try again."
-                )
-            else:
-                await query.edit_message_text(f"❌ Failed to start Web UI: {result}")
-
-        elif query.data == "webui_stop":
-            result = self._stop_web_ui()
-            if result == "not_running":
-                await query.edit_message_text("⚪ Web UI was not running.")
-            else:
-                await query.edit_message_text("⏹ Web UI stopped.")
-
-        else:  # webui_open
-            await query.edit_message_text(
-                "🌐 Open the dashboard in your browser:\n\nhttp://localhost:8080"
-            )
-
     async def _reset_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message or update.effective_message
         keyboard = InlineKeyboardMarkup([
@@ -710,46 +681,15 @@ class TelegramBot:
     async def _start_bot(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         global _trading_active
         _trading_active = True
-        try:
-            override_path = Path(__file__).resolve().parent.parent / "config" / "mode_override.json"
-            override_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {}
-            if override_path.exists():
-                import json
-                with open(override_path) as f:
-                    data = json.load(f)
-            data["trading_paused"] = False
-            with open(override_path, "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception:
-            pass
-        web_status = self._start_web_ui()
-        web_note = "" if web_status in ("started", "already_running") else f"\n⚠️ Web server: {web_status}"
-        await update.message.reply_text(
-            f"▶️ Trading resumed. Web dashboard at http://localhost:8080{web_note}",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        logger.info("Trading resumed via Telegram")
+        await update.message.reply_text("▶️ Trading resumed.")
 
     async def _stop_bot(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         global _trading_active
         _trading_active = False
-        try:
-            override_path = Path(__file__).resolve().parent.parent / "config" / "mode_override.json"
-            override_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {}
-            if override_path.exists():
-                import json
-                with open(override_path) as f:
-                    data = json.load(f)
-            data["trading_paused"] = True
-            with open(override_path, "w") as f:
-                json.dump(data, f, indent=2)
-        except Exception:
-            pass
-        self._stop_web_ui()
+        logger.info("Trading paused via Telegram")
         await update.message.reply_text(
-            "⏸ Trading paused. Web server stopped.\nOpen positions will still close. Tap ▶️ Resume to continue.",
-            parse_mode=ParseMode.MARKDOWN,
+            "⏸ Trading paused. Open positions will still close. Tap ▶️ Resume to continue.",
         )
 
     # ── Background Jobs ────────────────────────────────────────────────────────
@@ -759,25 +699,14 @@ class TelegramBot:
         Trading cycle — runs blocking engine.run_cycle() in a thread pool.
         The event loop stays free, so commands respond instantly even while
         the trading cycle is running.
-        Pause can come from Telegram (⏸ Pause) or Web UI (writes mode_override.json).
         """
-        global _trading_active
+        global _trading_active, _last_error
         if not _trading_active:
             return
-        # Web UI pause (mode_override.json)
-        try:
-            override_path = Path(__file__).resolve().parent.parent / "config" / "mode_override.json"
-            if override_path.exists():
-                import json
-                with open(override_path) as f:
-                    ov = json.load(f)
-                if ov.get("trading_paused"):
-                    return
-        except Exception:
-            pass
         try:
             events = await asyncio.to_thread(self.engine.run_cycle)
         except Exception as exc:
+            _last_error = f"{type(exc).__name__}: {exc}"
             logger.error("Trading cycle error: %s\n%s", exc, traceback.format_exc())
             await self._notify(f"⚠️ Trading cycle error: `{exc}`")
             return
@@ -791,6 +720,7 @@ class TelegramBot:
             if insight and insight.get("n", 0) > 0:
                 await self._notify(_format_learning_update(insight))
         except Exception as exc:
+            _last_error = f"Learner: {type(exc).__name__}: {exc}"
             logger.error("Learner error: %s", exc)
 
     async def _refresh_sentiment_job(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -904,7 +834,6 @@ class TelegramBot:
         add = self.app.add_handler
         # Inline keyboard callbacks (confirm/cancel pop-ups)
         add(CallbackQueryHandler(self._wrap_cmd(self._reset_callback), pattern="^reset_(confirm|cancel)$"))
-        add(CallbackQueryHandler(self._wrap_cmd(self._web_ui_callback), pattern="^webui_(start|stop|open)$"))
         # ALL non-command text → button router (exact dict match, no regex fragility)
         add(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -918,6 +847,9 @@ class TelegramBot:
             ("wallets", self._wallets),
             ("live_check", self._live_check),
             ("trades", self._trades),
+            ("health", self._health),
+            ("config", self._config),
+            ("restart_safe", self._restart_safe),
         ]:
             add(CommandHandler(cmd, self._wrap_cmd(handler)))
 

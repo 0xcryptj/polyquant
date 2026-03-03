@@ -4,8 +4,7 @@ Entry point — PolyQuant paper trading Telegram bot.
 Usage:
     python bot/main.py
 
-Trading, data refresh, and the web dashboard start immediately on launch.
-Open http://localhost:8080 in your browser once the bot is running.
+Trading and data refresh start immediately on launch.
 
 Quick-start guide:
   1. Copy .env.example → .env and fill in:
@@ -164,7 +163,7 @@ def main() -> None:
     bot     = TelegramBot(engine=engine, learner=learner)
 
     logger.info(
-        "Starting PolyQuant bot (chat=%s) — trading starts automatically. Web dashboard at http://localhost:8080",
+        "Starting PolyQuant bot (chat=%s) — trading starts automatically.",
         settings.telegram_chat_id,
     )
     try:

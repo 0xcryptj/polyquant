@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  polyquant:
+    build: .
+    image: polyquant:latest
+    container_name: polyquant
+    restart: unless-stopped
+
+    # Load all secrets from .env — never committed to git
+    env_file: .env
+
+    volumes:
+      # Persist SQLite DB and logs outside the container
+      - ./paper_trading:/app/paper_trading
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

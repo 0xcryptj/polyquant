@@ -102,6 +102,25 @@ class TradingService(BaseService):
 
             t0 = time.monotonic()
 
+            # ── Execution provider risk gate ──────────────────────────────────
+            ep = self.ctx.execution_provider
+            if ep is not None:
+                can_exec, reason = await asyncio.to_thread(ep.can_execute)
+                if not can_exec:
+                    log.warning("provider.vetoed", reason=reason)
+                    if self.ctx.blotter:
+                        self.ctx.blotter.record_provider_veto(
+                            provider  = ep.name,
+                            reason    = reason,
+                            token_id  = "",
+                            size_usdc = 0.0,
+                        )
+                    await self.ctx.send_alert(
+                        f"⚠️ *Execution provider vetoed cycle*\n{reason}"
+                    )
+                    await self._sleep(30)
+                    continue
+
             # ── Run cycle in thread pool (never blocks event loop) ─────────────
             try:
                 events = await asyncio.to_thread(self.ctx.engine.run_cycle)
@@ -149,6 +168,34 @@ class TradingService(BaseService):
     async def _dispatch(self, event: dict) -> None:
         etype = event.get("type")
 
+        # ── Blotter recording ──────────────────────────────────────────────────
+        blotter = self.ctx.blotter
+        if blotter is not None:
+            if etype == "trade_opened":
+                blotter.record_order_placed(
+                    order_id  = str(event.get("trade_id", "")),
+                    token_id  = str(event.get("token_id", "")),
+                    direction = str(event.get("direction", "")),
+                    size_usdc = float(event.get("size_usdc", 0)),
+                    price     = float(event.get("entry_price", 0)),
+                    edge      = float(event.get("edge", 0)),
+                    provider  = getattr(self.ctx.execution_provider, "name", "clob"),
+                    paper     = bool(event.get("simulated", True)),
+                )
+            elif etype == "trade_resolved":
+                blotter.record_order_filled(
+                    order_id   = str(event.get("trade_id", "")),
+                    pnl        = float(event.get("pnl", 0)),
+                    exit_price = float(event.get("exit_price", 0)),
+                    balance    = float(event.get("balance", 0)),
+                    won        = bool(event.get("won", False)),
+                )
+            elif etype == "kill_switch":
+                blotter.record_kill_switch(
+                    reason  = str(event.get("reason", "")),
+                    balance = float(event.get("balance", 0)),
+                )
+
         # Kill switch: pause trading immediately
         if etype == "kill_switch":
             self.ctx.trading_active.clear()
@@ -167,9 +214,16 @@ class TradingService(BaseService):
         try:
             insight = await asyncio.to_thread(self.ctx.learner.maybe_learn)
             if insight and insight.get("n", 0) > 0:
-                log.info("learner.updated",
-                         n=insight["n"],
-                         win_rate=round(insight.get("win_rate", 0), 3))
+                n        = insight["n"]
+                win_rate = round(insight.get("win_rate", 0), 3)
+                log.info("learner.updated", n=n, win_rate=win_rate)
+                if self.ctx.blotter:
+                    self.ctx.blotter.record_learner_updated(
+                        n        = n,
+                        win_rate = win_rate,
+                        min_edge = insight.get("min_edge"),
+                        kelly    = insight.get("kelly_fraction"),
+                    )
         except Exception as exc:
             log.warning("learner.error", error=str(exc))
 

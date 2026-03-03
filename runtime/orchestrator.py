@@ -6,6 +6,13 @@ Startup order:  DataService → TradingService → SupervisorService
 
 Shutdown order: reverse (WebService first, DataService last).
 Each service gets _STOP_TIMEOUT seconds before the orchestrator moves on.
+
+Provider bootstrap (synchronous, before any service starts):
+  1. TradeBlotter (audit log)
+  2. WalletProvider (sdk | agentic | none)
+  3. ExecutionProvider (clob | cli)
+  4. PaperEngine  (receives blotter reference)
+  5. Learner
 """
 from __future__ import annotations
 
@@ -35,12 +42,16 @@ _HEALTH_INTERVAL = 60   # seconds between orchestrator health sweeps
 class Orchestrator:
     def __init__(
         self,
-        enable_telegram: bool = True,
-        enable_web: bool      = False,
+        enable_telegram:    bool = True,
+        enable_web:         bool = False,
+        wallet_provider:    str | None = None,
+        execution_provider: str | None = None,
     ) -> None:
-        self.enable_telegram = enable_telegram
-        self.enable_web      = enable_web
-        self.ctx             = RuntimeContext()
+        self.enable_telegram    = enable_telegram
+        self.enable_web         = enable_web
+        self._wallet_prov_name  = wallet_provider    or settings.wallet_provider
+        self._exec_prov_name    = execution_provider or settings.execution_provider
+        self.ctx                = RuntimeContext()
         self._services: List[BaseService] = []
 
     # ── Public ────────────────────────────────────────────────────────────────
@@ -49,13 +60,26 @@ class Orchestrator:
         log.info("boot",
                  version="2.0.0",
                  paper=settings.paper_trading,
+                 wallet_provider=self._wallet_prov_name,
+                 execution_provider=self._exec_prov_name,
                  telegram=self.enable_telegram,
                  web=self.enable_web)
 
-        # ── Initialise DB and shared domain objects ───────────────────────────
+        # ── 1. Audit log (blotter) ────────────────────────────────────────────
+        from paper_trading.blotter import TradeBlotter
+        self.ctx.blotter = TradeBlotter()
+        log.info("blotter.ready", path=self.ctx.blotter.path())
+
+        # ── 2. Providers (synchronous, before any async service) ──────────────
+        self._bootstrap_providers()
+
+        # ── 3. Initialise DB and shared domain objects ────────────────────────
         db.init_db()
-        self.ctx.engine  = PaperEngine(starting_balance=STARTING_PAPER_BALANCE)
-        self.ctx.learner = Learner()
+        engine             = PaperEngine(starting_balance=STARTING_PAPER_BALANCE)
+        engine.blotter     = self.ctx.blotter
+        engine.execution_provider = self.ctx.execution_provider
+        self.ctx.engine    = engine
+        self.ctx.learner   = Learner()
 
         # ── Install OS signal handlers ────────────────────────────────────────
         self._install_signal_handlers()
@@ -85,6 +109,72 @@ class Orchestrator:
             await self._shutdown(exit_code=0)
 
     # ── Private ───────────────────────────────────────────────────────────────
+
+    def _bootstrap_providers(self) -> None:
+        """
+        Initialise WalletProvider and ExecutionProvider synchronously.
+
+        Failures are non-fatal in paper mode but fatal in live mode
+        (paper_trading=false).
+        """
+        # ── Wallet provider ───────────────────────────────────────────────────
+        wp_name = (self._wallet_prov_name or "").lower()
+        if wp_name in ("none", ""):
+            log.info("wallet_provider.skipped")
+        elif wp_name == "agentic":
+            try:
+                from wallets.providers.coinbase_agentic import CoinbaseAgenticProvider
+                self.ctx.wallet_provider = CoinbaseAgenticProvider()
+                log.info("wallet_provider.ready", provider="agentic")
+            except Exception as exc:
+                self._provider_error("wallet", "agentic", exc)
+        else:
+            # Default: "sdk"
+            try:
+                from wallets.providers.clob_wallet import ClobWalletProvider
+                self.ctx.wallet_provider = ClobWalletProvider()
+                log.info("wallet_provider.ready", provider="sdk")
+            except Exception as exc:
+                self._provider_error("wallet", "sdk", exc)
+
+        # ── Execution provider ────────────────────────────────────────────────
+        ep_name = (self._exec_prov_name or "clob").lower()
+        if ep_name == "cli":
+            try:
+                from execution.providers.polymarket_cli import PolymarketCLIProvider
+                self.ctx.execution_provider = PolymarketCLIProvider()
+                log.info("execution_provider.ready", provider="cli")
+            except Exception as exc:
+                self._provider_error("execution", "cli", exc)
+        else:
+            # Default: "clob"
+            try:
+                clob_client = None
+                if self.ctx.wallet_provider is not None:
+                    # Reuse the CLOB client already initialised by sdk wallet
+                    try:
+                        bundle      = self.ctx.wallet_provider._get_bundle()  # type: ignore[attr-defined]
+                        clob_client = bundle.clob_client
+                    except AttributeError:
+                        pass
+                from execution.providers.clob import ClobExecutionProvider
+                self.ctx.execution_provider = ClobExecutionProvider(clob_client=clob_client)
+                log.info("execution_provider.ready", provider="clob")
+            except Exception as exc:
+                self._provider_error("execution", "clob", exc)
+
+    def _provider_error(self, kind: str, name: str, exc: Exception) -> None:
+        if settings.paper_trading:
+            log.warning(
+                f"{kind}_provider.init_failed (non-fatal in paper mode)",
+                provider=name, error=str(exc),
+            )
+        else:
+            log.critical(
+                f"{kind}_provider.init_failed (FATAL in live mode)",
+                provider=name, error=str(exc),
+            )
+            sys.exit(1)
 
     def _build_services(self) -> List[BaseService]:
         svcs: List[BaseService] = [

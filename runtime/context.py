@@ -14,6 +14,9 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 if TYPE_CHECKING:
     from paper_trading.engine import PaperEngine
     from paper_trading.learner import Learner
+    from paper_trading.blotter import TradeBlotter
+    from wallets.providers.base import WalletProvider
+    from execution.providers.base import ExecutionProvider
 
 BOT_VERSION = "2.0.0"
 
@@ -43,6 +46,13 @@ class RuntimeContext:
     # ── Shared domain objects (injected by Orchestrator after construction) ───
     engine:  "PaperEngine | None" = None
     learner: "Learner | None"     = None
+
+    # ── Provider layer (injected by Orchestrator) ─────────────────────────────
+    wallet_provider:    "WalletProvider | None"    = None
+    execution_provider: "ExecutionProvider | None" = None
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    blotter: "TradeBlotter | None" = None
 
     # ── Data caches (written by DataService, read by Telegram + Web) ──────────
     sentiment_cache:      "dict | None" = None

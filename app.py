@@ -23,7 +23,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="PolyQuant trading bot")
+    p = argparse.ArgumentParser(
+        description="PolyQuant trading bot",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Provider examples:
+  python app.py                                       # paper trading defaults
+  python app.py --wallet-provider=sdk                 # Phase 2: live CLOB wallet
+  python app.py --wallet-provider=agentic             # Phase 3: awal CLI wallet
+  python app.py --execution-provider=cli              # Phase 4: CLI execution
+  python app.py --no-telegram --no-web --log-json     # headless production
+""",
+    )
     p.add_argument("--no-telegram", action="store_true",
                    help="Disable Telegram interface")
     p.add_argument("--no-web", action="store_true",
@@ -32,6 +43,12 @@ def parse_args() -> argparse.Namespace:
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--log-json", action="store_true",
                    help="Output structured JSON logs (recommended in production)")
+    p.add_argument("--wallet-provider",
+                   choices=["sdk", "agentic", "none"], default=None,
+                   help="Wallet backend (overrides WALLET_PROVIDER in .env)")
+    p.add_argument("--execution-provider",
+                   choices=["clob", "cli"], default=None,
+                   help="Execution backend (overrides EXECUTION_PROVIDER in .env)")
     return p.parse_args()
 
 
@@ -57,8 +74,10 @@ def main() -> None:
 
     from runtime.orchestrator import Orchestrator
     orch = Orchestrator(
-        enable_telegram=not args.no_telegram,
-        enable_web=not args.no_web,
+        enable_telegram    = not args.no_telegram,
+        enable_web         = not args.no_web,
+        wallet_provider    = args.wallet_provider,
+        execution_provider = args.execution_provider,
     )
 
     try:

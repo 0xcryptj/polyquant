@@ -118,6 +118,43 @@ class Settings(BaseSettings):
     # ── Market Config Path ────────────────────────────────────────────────────
     btc_markets_config: str = Field(default="config/btc_markets.json")
 
+    # ── Provider selection ────────────────────────────────────────────────────
+    wallet_provider: str = Field(
+        default="sdk",
+        description="Wallet backend: sdk | agentic | none",
+    )
+    execution_provider: str = Field(
+        default="clob",
+        description="Execution backend: clob | cli",
+    )
+
+    # ── Coinbase Agentic Wallet (awal CLI) ────────────────────────────────────
+    awal_session_file: str = Field(
+        default="~/.polyquant/awal_session.json",
+        description="Path where awal CLI stores auth session token",
+    )
+    awal_cmd_timeout: int = Field(
+        default=30,
+        ge=5, le=120,
+        description="Timeout in seconds for each awal CLI subprocess call",
+    )
+
+    # ── Polymarket CLI execution provider ─────────────────────────────────────
+    polymarket_cli_cmd: str = Field(
+        default="",
+        description=(
+            "CLI command to use when EXECUTION_PROVIDER=cli. "
+            "Examples: 'polymarket-cli'  'npx @polymarket/clob-cli'  "
+            "'python -m polymarket'"
+        ),
+    )
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    audit_log_path: str = Field(
+        default="paper_trading/audit.log",
+        description="Path to the append-only JSONL trade blotter",
+    )
+
     # ── Internal constants ───────────────────────────────────────────────────
     POLYMARKET_FEE: ClassVar[float] = 0.02
     POLYGON_CHAIN_ID: ClassVar[int] = 137

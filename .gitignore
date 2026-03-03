@@ -99,6 +99,7 @@ Thumbs.db
 # ── Runtime state ─────────────────────────────────────────────────────────────
 *.pid
 paper_trading/bot.pid
+artifacts/
 
 # ── Node (polymarket-cli) ─────────────────────────────────────────────────────
 node_modules/

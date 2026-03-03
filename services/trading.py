@@ -152,6 +152,33 @@ class TradingService(BaseService):
                      resolved=resolved,
                      balance=round(self.ctx.engine.balance, 2))
 
+            # ── Update state store ────────────────────────────────────────────
+            ss = getattr(self.ctx, "state_store", None)
+            if ss is not None:
+                from datetime import datetime, timezone
+                last_tick = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                positions = []
+                try:
+                    raw = self.ctx.engine.get_open_positions_for_display()
+                    for p in raw:
+                        snap = {
+                            "id": p.get("id"),
+                            "direction": p.get("direction"),
+                            "size_usdc": p.get("size_usdc"),
+                            "btc_price_entry": p.get("btc_price_entry"),
+                        }
+                        if "opened_at" in p:
+                            ot = p["opened_at"]
+                            snap["opened_at"] = ot.isoformat() if hasattr(ot, "isoformat") else str(ot)
+                        positions.append(snap)
+                except Exception:
+                    pass
+                ss.update(
+                    last_tick=last_tick,
+                    enabled=self.ctx.trading_active.is_set(),
+                    positions=positions,
+                )
+
             # ── Dispatch events ───────────────────────────────────────────────
             for event in events:
                 await self._dispatch(event)

@@ -7,6 +7,9 @@ Startup order:  DataService → TradingService → SupervisorService
 Shutdown order: reverse (WebService first, DataService last).
 Each service gets _STOP_TIMEOUT seconds before the orchestrator moves on.
 
+Writes PID file to artifacts/runtime.pid for process management.
+Integrates StateStore for runtime state persistence (artifacts/state/runtime.json).
+
 Provider bootstrap (synchronous, before any service starts):
   1. TradeBlotter (audit log)
   2. WalletProvider (sdk | agentic | none)
@@ -17,13 +20,16 @@ Provider bootstrap (synchronous, before any service starts):
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
+from pathlib import Path
 from typing import List
 
 import structlog
 
 from config.settings import settings
+from runtime.state_store import StateStore, get_state_store
 from paper_trading.engine import PaperEngine, STARTING_PAPER_BALANCE
 from paper_trading.learner import Learner
 from paper_trading import persistence as db
@@ -37,6 +43,8 @@ log = structlog.get_logger("orchestrator")
 
 _STOP_TIMEOUT    = 30   # seconds per service on graceful shutdown
 _HEALTH_INTERVAL = 60   # seconds between orchestrator health sweeps
+_ARTIFACTS_DIR   = Path(__file__).resolve().parent.parent / "artifacts"
+_PID_FILE        = _ARTIFACTS_DIR / "runtime.pid"
 
 
 class Orchestrator:
@@ -64,6 +72,23 @@ class Orchestrator:
                  execution_provider=self._exec_prov_name,
                  telegram=self.enable_telegram,
                  web=self.enable_web)
+
+        # ── 0. State store + PID file ────────────────────────────────────────
+        state_store = get_state_store()
+        state_store.load()
+        mode = "paper" if settings.paper_trading else "live"
+        state_store.update(
+            enabled=self.ctx.trading_active.is_set(),
+            mode=mode,
+        )
+        self.ctx.state_store = state_store
+
+        _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            _PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+            log.info("pid_file.written", path=str(_PID_FILE))
+        except OSError as exc:
+            log.warning("pid_file.failed", path=str(_PID_FILE), error=str(exc))
 
         # ── 1. Audit log (blotter) ────────────────────────────────────────────
         from paper_trading.blotter import TradeBlotter
@@ -121,6 +146,20 @@ class Orchestrator:
         wp_name = (self._wallet_prov_name or "").lower()
         if wp_name in ("none", ""):
             log.info("wallet_provider.skipped")
+        elif wp_name == "mock":
+            try:
+                from wallets.providers.mock_wallet import MockWalletProvider
+                self.ctx.wallet_provider = MockWalletProvider()
+                log.info("wallet_provider.ready", provider="mock")
+            except Exception as exc:
+                self._provider_error("wallet", "mock", exc)
+        elif wp_name == "awal":
+            try:
+                from wallets.providers.coinbase_awal import CoinbaseAWALProvider
+                self.ctx.wallet_provider = CoinbaseAWALProvider()
+                log.info("wallet_provider.ready", provider="awal")
+            except Exception as exc:
+                self._provider_error("wallet", "awal", exc)
         elif wp_name == "agentic":
             try:
                 from wallets.providers.coinbase_agentic import CoinbaseAgenticProvider
@@ -187,7 +226,8 @@ class Orchestrator:
             svcs.append(TelegramService(self.ctx))
         if self.enable_web:
             from services.web import WebService
-            svcs.append(WebService(self.ctx))
+            port = getattr(settings, "web_port", 8080)
+            svcs.append(WebService(self.ctx, port=port))
         return svcs
 
     async def _monitor_loop(self) -> None:
@@ -217,6 +257,17 @@ class Orchestrator:
 
     async def _shutdown(self, exit_code: int = 0) -> None:
         log.info("shutdown.begin", exit_code=exit_code)
+
+        # Update state + remove PID file
+        ss = getattr(self.ctx, "state_store", None)
+        if ss is not None:
+            ss.update(enabled=False)
+        try:
+            if _PID_FILE.exists():
+                _PID_FILE.unlink()
+                log.debug("pid_file.removed", path=str(_PID_FILE))
+        except OSError:
+            pass
 
         # Signal all loops to stop
         self.ctx.shutdown_event.set()

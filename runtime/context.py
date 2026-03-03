@@ -54,6 +54,9 @@ class RuntimeContext:
     # ── Audit log ─────────────────────────────────────────────────────────────
     blotter: "TradeBlotter | None" = None
 
+    # ── State store (persists enabled, mode, last_tick, etc.) ─────────────────
+    state_store: "Any | None" = None
+
     # ── Data caches (written by DataService, read by Telegram + Web) ──────────
     sentiment_cache:      "dict | None" = None
     wallet_report_cache:  str           = "Wallet data loading…"
@@ -80,6 +83,8 @@ class RuntimeContext:
     def record_error(self, msg: str) -> None:
         self.last_error      = msg
         self.last_error_time = time.monotonic()
+        if self.state_store is not None:
+            self.state_store.update(last_error=msg)
 
     async def send_alert(self, text: str) -> None:
         """Dispatch an alert to Telegram if the hook is wired; otherwise no-op."""

@@ -1,0 +1,52 @@
+# ════════════════════════════════════════════════════════════════════════════
+# systemd unit for PolyQuant trading bot (Docker-based deployment)
+#
+# Install:
+#   sudo cp systemd/polyquant.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polyquant
+#
+# Requires Docker + docker compose v2 installed on the host.
+# ════════════════════════════════════════════════════════════════════════════
+
+[Unit]
+Description=PolyQuant BTC Prediction Market Trading Bot
+Documentation=https://github.com/0xcryptj/polyquant
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Change to your actual deployment directory
+WorkingDirectory=/opt/polyquant
+
+# Start: build if needed, then start detached
+ExecStart=/usr/local/bin/docker compose up -d --build polyquant
+
+# Stop: graceful shutdown (Docker handles SIGTERM → container stop)
+ExecStop=/usr/local/bin/docker compose down polyquant
+
+# Reload: rolling restart (stop + start)
+ExecReload=/usr/local/bin/docker compose restart polyquant
+
+# Safety: restart on failure, but not on clean stop
+Restart=on-failure
+RestartSec=30s
+
+# Give Docker time to pull/build image on first start
+TimeoutStartSec=300s
+TimeoutStopSec=60s
+
+# Run as root (Docker socket requires it) or the docker group user
+User=root
+
+# Log to journald (use: journalctl -u polyquant -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polyquant
+
+[Install]
+WantedBy=multi-user.target

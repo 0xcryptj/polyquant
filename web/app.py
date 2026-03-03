@@ -1,7 +1,8 @@
 """
 PolyQuant Web GUI — Trading terminal dashboard.
 
-Run: uvicorn web.app:app --reload --host 0.0.0.0 --port 8080
+Standalone:  uvicorn web.app:app --reload --host 0.0.0.0 --port 8080
+In-process:  from web.app import create_app; app = create_app(ctx)
 
 Features:
   - Dashboard with bankroll, PnL, positions, trades
@@ -16,6 +17,7 @@ import json
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,22 +25,43 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+if TYPE_CHECKING:
+    from runtime.context import RuntimeContext
+
 # Project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-app = FastAPI(title="PolyQuant Terminal", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ── Runtime context (injected by create_app; None in standalone mode) ─────────
+_ctx: "RuntimeContext | None" = None
 
-# Mount static files
-static_dir = PROJECT_ROOT / "web" / "static"
-static_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+def create_app(ctx: "RuntimeContext") -> FastAPI:
+    """
+    Factory for in-process use: wires the shared RuntimeContext into the
+    FastAPI app so pause/resume endpoints use ctx.trading_active directly.
+    Call this from WebService instead of importing the module-level `app`.
+    """
+    global _ctx
+    _ctx = ctx
+    return app
+
+
+def _make_app() -> FastAPI:
+    a = FastAPI(title="PolyQuant Terminal", version="2.0.0")
+    a.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    static_dir = PROJECT_ROOT / "web" / "static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    a.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    return a
+
+
+app = _make_app()
 
 
 def _load_engine_status() -> dict | None:
@@ -273,8 +296,11 @@ async def api_status():
     s = _load_status_from_db()
     from config.settings import settings
     s.setdefault("paper_trading", settings.paper_trading)
-    ov = _read_mode_override()
-    s["trading_paused"] = ov.get("trading_paused", False)
+    if _ctx is not None:
+        s["trading_paused"] = not _ctx.trading_active.is_set()
+    else:
+        ov = _read_mode_override()
+        s["trading_paused"] = ov.get("trading_paused", False)
     return s
 
 
@@ -408,8 +434,11 @@ async def api_dashboard():
     }
     from config.settings import settings
     status.setdefault("paper_trading", settings.paper_trading)
-    ov = _read_mode_override()
-    status["trading_paused"] = ov.get("trading_paused", False)
+    if _ctx is not None:
+        status["trading_paused"] = not _ctx.trading_active.is_set()
+    else:
+        ov = _read_mode_override()
+        status["trading_paused"] = ov.get("trading_paused", False)
 
     p = db.get_all_params()
     status["params"] = {
@@ -587,21 +616,33 @@ async def api_set_mode(body: ModeUpdate):
 
 @app.post("/api/pause")
 async def api_pause():
-    """Pause trading loop. Bot reads this each cycle."""
-    _write_mode_override({"trading_paused": True})
+    """Pause trading loop."""
+    if _ctx is not None:
+        _ctx.trading_active.clear()
+    else:
+        _write_mode_override({"trading_paused": True})
     return {"ok": True, "trading_paused": True}
 
 
 @app.post("/api/resume")
 async def api_resume():
     """Resume trading loop."""
-    _write_mode_override({"trading_paused": False})
+    if _ctx is not None:
+        _ctx.trading_active.set()
+    else:
+        _write_mode_override({"trading_paused": False})
     return {"ok": True, "trading_paused": False}
 
 
 @app.get("/api/trading-state")
 async def api_trading_state():
     """Get current trading state (paused, paper_trading)."""
+    if _ctx is not None:
+        from config.settings import settings
+        return {
+            "paper_trading": settings.paper_trading,
+            "trading_paused": not _ctx.trading_active.is_set(),
+        }
     return _read_mode_override()
 
 
@@ -998,4 +1039,21 @@ async def api_performance():
         "max_dd": round(max_dd, 4),
         "avg_edge": round(avg_edge, 4),
         "avg_pnl": round(avg_pnl, 4),
+    }
+
+
+@app.get("/api/health")
+async def api_health():
+    """Runtime health: service states, uptime, last error. Requires in-process mode."""
+    if _ctx is None:
+        return {"mode": "standalone", "healthy": True}
+    from runtime.context import BOT_VERSION
+    return {
+        "mode": "orchestrated",
+        "version": BOT_VERSION,
+        "healthy": True,
+        "uptime": _ctx.uptime_str,
+        "uptime_seconds": round(_ctx.uptime_seconds),
+        "trading_active": _ctx.trading_active.is_set(),
+        "last_error": _ctx.last_error or None,
     }

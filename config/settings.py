@@ -166,14 +166,24 @@ class Settings(BaseSettings):
         return self
 
     def safe_summary(self) -> dict:
+        anthropic_key = None
+        if self.anthropic_api_key:
+            try:
+                anthropic_key = "set" if self.anthropic_api_key.get_secret_value() else "not set"
+            except Exception:
+                anthropic_key = "not set"
         return {
+            "paper_trading":        self.paper_trading,
             "polymarket_clob_host": self.polymarket_clob_host,
-            "polymarket_gamma_host": self.polymarket_gamma_host,
-            "polymarket_api_key": (self.polymarket_api_key[:8] + "...") if self.polymarket_api_key else "(not set)",
-            "wallet_address": self.wallet_address,
-            "paper_trading": self.paper_trading,
-            "kelly_fraction": self.kelly_fraction,
-            "min_edge_threshold": self.min_edge_threshold,
+            "polymarket_api_key":   (self.polymarket_api_key[:8] + "…") if self.polymarket_api_key else "(not set)",
+            "wallet_address":       self.wallet_address,
+            "binance_base_url":     self.binance_base_url,
+            "kelly_fraction":       self.kelly_fraction,
+            "min_edge_threshold":   self.min_edge_threshold,
+            "max_spread":           self.max_spread,
+            "max_position_usdc":    self.max_position_usdc,
+            "max_daily_drawdown":   f"{self.max_daily_drawdown_pct:.0%}",
+            "anthropic_key":        anthropic_key or "not set",
         }
 
     @property
@@ -199,3 +209,62 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def validate_startup(require_telegram: bool = True) -> None:
+    """
+    Fail fast before spawning any service.
+
+    Validates required env vars and sane parameter ranges.
+    Raises SystemExit with a clear message on failure.
+    """
+    import sys
+    errors: list[str] = []
+
+    if require_telegram:
+        try:
+            tok = settings.telegram_bot_token.get_secret_value()
+        except Exception:
+            tok = ""
+        if not tok:
+            errors.append("TELEGRAM_BOT_TOKEN is not set")
+        if not settings.telegram_chat_id:
+            errors.append("TELEGRAM_CHAT_ID is not set")
+
+    if not settings.paper_trading:
+        # Live trading: validate all required credentials
+        if not settings.polymarket_api_key:
+            errors.append("POLYMARKET_API_KEY required for live trading (PAPER_TRADING=false)")
+        try:
+            pk = settings.wallet_private_key.get_secret_value()
+        except Exception:
+            pk = ""
+        if not pk:
+            errors.append("WALLET_PRIVATE_KEY required for live trading")
+        if settings.wallet_address == "0x0000000000000000000000000000000000000000":
+            errors.append("WALLET_ADDRESS required for live trading")
+
+    if settings.kelly_fraction > 0.5:
+        errors.append(
+            f"KELLY_FRACTION={settings.kelly_fraction} exceeds 0.5 — dangerously high. "
+            "Use 0.1–0.25 for safety."
+        )
+
+    if settings.max_daily_drawdown_pct > 0.20:
+        errors.append(
+            f"MAX_DAILY_DRAWDOWN_PCT={settings.max_daily_drawdown_pct:.0%} > 20% — "
+            "review risk parameters before proceeding."
+        )
+
+    if errors:
+        print("\nFATAL: Configuration errors detected:\n", file=sys.stderr)
+        for e in errors:
+            print(f"  ✗  {e}", file=sys.stderr)
+        print(
+            "\nFix these in your .env file. "
+            "See .env.example for all required variables.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    logger.info("Config validated — all required env vars present.")

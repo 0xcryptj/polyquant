@@ -2,7 +2,9 @@ version: "3.9"
 
 services:
   polyquant:
-    build: .
+    build:
+      context: .
+      target: runtime
     image: polyquant:latest
     container_name: polyquant
     restart: unless-stopped
@@ -10,12 +12,47 @@ services:
     # Load all secrets from .env — never committed to git
     env_file: .env
 
+    environment:
+      # Override individual vars here (takes precedence over .env)
+      PYTHONUNBUFFERED: "1"
+
+    ports:
+      # Web dashboard — change host port if 8080 is taken
+      - "${WEB_PORT:-8080}:8080"
+
     volumes:
-      # Persist SQLite DB and logs outside the container
-      - ./paper_trading:/app/paper_trading
+      # Named volume: SQLite DB + PID file survive container restarts
+      - paper_trading_data:/app/paper_trading
+      # Bind-mount for live log tailing from the host
+      - ./logs:/app/logs
+
+    # Resource limits — prevents runaway memory on a VPS
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "from paper_trading import persistence as db; db.init_db(); print('ok')"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "5"
+
+    # Pass CLI flags to app.py via command override (optional)
+    # command: ["python", "app.py", "--log-json"]
+
+
+volumes:
+  paper_trading_data:
+    driver: local

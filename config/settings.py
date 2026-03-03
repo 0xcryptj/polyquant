@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     # ── Telegram ─────────────────────────────────────────────────────────────
     telegram_bot_token: SecretStr = Field(..., description="Telegram bot token from @BotFather")
     telegram_chat_id: str = Field(..., description="Telegram chat ID for notifications")
+    telegram_admin_id: str | None = Field(
+        default=None,
+        description="Telegram user ID for admin (full control). If unset, uses TELEGRAM_CHAT_ID.",
+    )
 
     # ── Anthropic / Claude ────────────────────────────────────────────────────
     anthropic_api_key: SecretStr | None = Field(default=None, description="Anthropic API key")
@@ -138,6 +142,10 @@ class Settings(BaseSettings):
         ge=5, le=120,
         description="Timeout in seconds for each awal CLI subprocess call",
     )
+    awal_bin: str = Field(
+        default="awal",
+        description="awal CLI binary (e.g. 'awal' or 'npx awal@latest'). Used for wallet_ui.",
+    )
 
     # ── Polymarket CLI execution provider ─────────────────────────────────────
     polymarket_cli_cmd: str = Field(
@@ -149,6 +157,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── Web UI / Status page ─────────────────────────────────────────────────
+    web_port: int = Field(
+        default=8080,
+        ge=1, le=65535,
+        description="Port for web dashboard. Default 8080.",
+    )
+    webui_port: int = Field(
+        default=8787,
+        ge=1, le=65535,
+        description="Port for minimal status page (optional). Default 8787.",
+    )
+
     # ── Audit log ─────────────────────────────────────────────────────────────
     audit_log_path: str = Field(
         default="paper_trading/audit.log",
@@ -156,6 +176,11 @@ class Settings(BaseSettings):
     )
 
     # ── Internal constants ───────────────────────────────────────────────────
+
+    @property
+    def telegram_admin_id_str(self) -> str:
+        """Admin ID for Telegram; falls back to chat_id if not set."""
+        return (self.telegram_admin_id or self.telegram_chat_id) or ""
     POLYMARKET_FEE: ClassVar[float] = 0.02
     POLYGON_CHAIN_ID: ClassVar[int] = 137
 

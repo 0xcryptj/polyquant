@@ -223,6 +223,14 @@ class TradingService(BaseService):
                     balance = float(event.get("balance", 0)),
                 )
 
+        # ── Strategy observer (shadow tracks per mode) ─────────────────────────
+        obs = getattr(self.ctx, "strategy_observer", None)
+        if obs is not None:
+            if etype == "trade_opened":
+                obs.on_trade_opened(event)
+            elif etype == "trade_resolved":
+                obs.on_trade_resolved(event)
+
         # Kill switch: pause trading immediately
         if etype == "kill_switch":
             self.ctx.trading_active.clear()
@@ -244,6 +252,16 @@ class TradingService(BaseService):
                 n        = insight["n"]
                 win_rate = round(insight.get("win_rate", 0), 3)
                 log.info("learner.updated", n=n, win_rate=win_rate)
+                if insight.get("retrained"):
+                    engine = getattr(self.ctx, "engine", None)
+                    if engine is not None and hasattr(engine, "invalidate_model_cache"):
+                        engine.invalidate_model_cache()
+                        log.info("calibration_model.reloaded")
+                        await self.ctx.send_alert(
+                            "🔄 *Model retrained*\n"
+                            f"Calibration model updated from {insight.get('n', 0)} trades. "
+                            f"Brier: {insight.get('brier', 0):.3f}"
+                        )
                 if self.ctx.blotter:
                     self.ctx.blotter.record_learner_updated(
                         n        = n,

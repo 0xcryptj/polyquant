@@ -118,6 +118,10 @@ class Settings(BaseSettings):
     garch_regime_percentile: float = Field(default=0.65, gt=0.0, lt=1.0)
     max_position_usdc: float = Field(default=50.0, gt=0.0)
     paper_trading: bool = Field(default=True)
+    sim_allow_negative_edge: bool = Field(
+        default=True,
+        description="If True, SIM mode allows min_edge down to -0.02 for more trade flow. Set False to use same min_edge as live and reduce losing streaks in SIM.",
+    )
 
     # ── Market Config Path ────────────────────────────────────────────────────
     btc_markets_config: str = Field(default="config/btc_markets.json")

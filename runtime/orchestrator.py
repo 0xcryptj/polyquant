@@ -105,6 +105,8 @@ class Orchestrator:
         engine.execution_provider = self.ctx.execution_provider
         self.ctx.engine    = engine
         self.ctx.learner   = Learner()
+        from observers.strategy_observer import StrategyObserver
+        self.ctx.strategy_observer = StrategyObserver()
 
         # ── Install OS signal handlers ────────────────────────────────────────
         self._install_signal_handlers()

@@ -170,7 +170,8 @@ class Learner:
         pnls = [t["pnl"] for t in trades if t["pnl"] is not None]
         win_rate = len([t for t in trades if t["status"] == "won"]) / len(trades)
         avg_pnl = float(np.mean(pnls)) if pnls else 0.0
-        avg_edge = float(np.mean([t["edge"] for t in trades]))
+        edges = [t["edge"] for t in trades if t.get("edge") is not None]
+        avg_edge = float(np.mean(edges)) if edges else 0.0
         brier = self._brier_score(trades)
         recent_wr = self._rolling_win_rate(trades, ROLLING_WINDOW)
 
@@ -202,6 +203,21 @@ class Learner:
             notes="; ".join(notes),
         )
 
+        # Retrain calibration model when poorly calibrated and enough data
+        retrained = False
+        if brier > 0.28 and n_closed >= 50:
+            try:
+                from learning.retrain import maybe_retrain
+                metrics = maybe_retrain(
+                    min_trades=50,
+                    min_brier_to_trigger=0.28,
+                    current_brier=brier,
+                    n_closed=n_closed,
+                )
+                retrained = metrics is not None
+            except Exception as exc:
+                logger.warning("Retrain skipped: %s", exc)
+
         return {
             "n": n_closed,
             "win_rate": win_rate,
@@ -211,6 +227,7 @@ class Learner:
             "new_edge": new_edge,
             "new_kelly": new_kelly,
             "notes": notes,
+            "retrained": retrained,
         }
 
     def _adapt_params(

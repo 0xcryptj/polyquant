@@ -1,15 +1,3 @@
-# ════════════════════════════════════════════════════════════════════════════
-# Polymarket Whale Wallet Watch List
-# Format: WALLET_ADDRESS | LABEL | NOTES
-# Blank lines and lines starting with # are ignored.
-#
-# To find wallets:
-#   1. Go to https://polymarket.com/leaderboard
-#   2. Click a top trader → copy their wallet from the URL
-#   3. Add entries below in the format: 0x... | LABEL | notes
-# ════════════════════════════════════════════════════════════════════════════
-
-# ── Add real whale wallets below (examples shown — replace with real ones) ───
-# 0xYOUR_WHALE_ADDRESS_1 | Whale Alpha | High win rate on BTC markets
-# 0xYOUR_WHALE_ADDRESS_2 | Whale Beta  | Large conviction trades
-
+# Polymarket wallets to track (one per line: address | label | notes)
+# First profile: tracked trader for Strategy/Wallet observer
+0x0ea574f3204c5c9c0cdead90392ea0990f4d17e4 | Trader 1 | first profile

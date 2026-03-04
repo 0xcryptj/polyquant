@@ -276,10 +276,13 @@ def resolve_trade_and_set_balance(
                WHERE id = ?""",
             (now, btc_price_exit, exit_price, pnl, status, new_balance, trade_id),
         )
+        # Use existing starting_usdc when row exists; 1000.0 default when inserting new row
+        row = conn.execute("SELECT starting_usdc FROM balance WHERE id = 1").fetchone()
+        starting = float(row["starting_usdc"]) if row and row["starting_usdc"] is not None else 1000.0
         conn.execute(
             "INSERT INTO balance (id, usdc, starting_usdc, updated_at) VALUES (1, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET usdc=excluded.usdc, updated_at=excluded.updated_at",
-            (new_balance, new_balance, now),
+            (new_balance, starting, now),
         )
         conn.commit()
     except Exception:

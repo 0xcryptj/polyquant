@@ -44,6 +44,51 @@ CLOB_BASE   = settings.polymarket_clob_host
 CACHE_TTL_SECONDS = 300
 
 
+def _format_market_title(question: str, end_date_iso: str) -> str:
+    """Build display title like 'Bitcoin Up or Down - March 3, 10:20PM-10:25PM ET'."""
+    if not question and not end_date_iso:
+        return "Unknown market"
+    try:
+        if end_date_iso:
+            dt = dateutil_parser.parse(end_date_iso)
+            if dt.tzinfo:
+                try:
+                    from zoneinfo import ZoneInfo
+                    dt = dt.astimezone(ZoneInfo("America/New_York"))
+                except Exception:
+                    pass
+            date_str = dt.strftime("%b %d, %I:%M%p").lstrip("0").replace("  ", " ")
+            if "ET" not in date_str and "UTC" not in date_str:
+                date_str += " ET"
+            return f"{question.strip()} - {date_str}" if question.strip() else date_str
+    except Exception:
+        pass
+    return question.strip() or "Unknown market"
+
+
+def position_to_card(p: WalletPosition) -> dict:
+    """Convert WalletPosition to web GUI card dict (market icon, title, direction, price, shares, PnL)."""
+    direction_short = "Up" if p.direction == "YES" else "Down"
+    price_cents = round(p.current_price * 100, 1)
+    shares = p.size_usdc / p.entry_price if p.entry_price else 0
+    position_usd = p.size_usdc + p.unrealized_pnl  # current value
+    pnl_pct = (p.unrealized_pnl / p.size_usdc * 100) if p.size_usdc else 0
+    return {
+        "market_icon": "BTC",  # could derive from market_question / slug later
+        "market_title": _format_market_title(p.market_question, p.end_date_iso),
+        "direction": p.direction,
+        "direction_short": direction_short,
+        "price_cents": price_cents,
+        "shares": round(shares, 1),
+        "current_cents": price_cents,
+        "max_cents": 100,
+        "position_usd": round(position_usd, 2),
+        "cost_usd": round(p.size_usdc, 2),
+        "pnl_usd": round(p.unrealized_pnl, 2),
+        "pnl_pct": round(pnl_pct, 2),
+    }
+
+
 # ── Data Classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -57,6 +102,7 @@ class WalletPosition:
     current_price: float
     unrealized_pnl: float
     market_question: str = ""
+    end_date_iso: str = ""   # for "March 3, 10:20PM-10:25PM ET" style title
 
 
 @dataclass
@@ -153,7 +199,7 @@ def _fetch_wallet_trades(wallet: str, client: httpx.Client, limit: int = 100) ->
 
 
 def _fetch_market_info(token_id: str, client: httpx.Client) -> dict:
-    """Fetch market metadata (question text, etc.) from Gamma."""
+    """Fetch market metadata (question, endDate) from Gamma."""
     try:
         resp = client.get(
             f"{GAMMA_BASE}/markets",
@@ -449,14 +495,24 @@ class WalletTracker:
         client: httpx.Client,
     ) -> list[WalletPosition]:
         enriched = []
-        for pos in positions[:10]:  # cap to avoid rate limits
+        for pos in positions[:15]:  # cap to avoid rate limits
             try:
                 token_id  = pos.get("asset_id", pos.get("token_id", ""))
+                if not token_id:
+                    continue
                 direction = pos.get("side", pos.get("outcome", "YES")).upper()
-                size      = float(pos.get("size", pos.get("cash_balance", 0)))
-                avg_price = float(pos.get("avg_price", pos.get("entry_price", 0.5)))
-                cur_price = float(pos.get("cur_price", pos.get("current_price", avg_price)))
+                # size can be in size, size_usdc, or cash_balance (value in USDC)
+                size      = float(pos.get("size", pos.get("size_usdc", pos.get("cash_balance", 0))))
+                avg_price = float(pos.get("avg_price", pos.get("entry_price", pos.get("avgPrice", 0.5))))
+                cur_price = float(pos.get("cur_price", pos.get("current_price", pos.get("curPrice", avg_price))))
                 unreal    = (cur_price - avg_price) * size if direction == "YES" else (avg_price - cur_price) * size
+
+                market_question = ""
+                end_date_iso    = ""
+                meta = _fetch_market_info(token_id, client)
+                if meta:
+                    market_question = meta.get("question", meta.get("title", "")) or ""
+                    end_date_iso    = meta.get("end_date_iso", meta.get("endDate", meta.get("end_date", ""))) or ""
 
                 enriched.append(WalletPosition(
                     wallet=wallet,
@@ -467,6 +523,8 @@ class WalletTracker:
                     entry_price=avg_price,
                     current_price=cur_price,
                     unrealized_pnl=unreal,
+                    market_question=market_question,
+                    end_date_iso=end_date_iso,
                 ))
             except Exception as exc:
                 logger.debug("Failed to parse position: %s", exc)

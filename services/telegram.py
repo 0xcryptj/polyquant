@@ -42,6 +42,7 @@ from paper_trading import persistence as db
 from paper_trading.utils import age_seconds, split_message
 from runtime.context import BOT_VERSION, RuntimeContext
 from services.base import BaseService, HealthStatus
+from services.telegram_formatters import format_pnl_card
 
 log = structlog.get_logger("telegram")
 
@@ -50,7 +51,7 @@ KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🚀 Start"),       KeyboardButton("▶️ Resume"),      KeyboardButton("⏸ Pause")],
         [KeyboardButton("📊 Status"),      KeyboardButton("📋 Positions"),   KeyboardButton("📈 Trades")],
-        [KeyboardButton("📉 Performance"), KeyboardButton("🌡 Sentiment"),   KeyboardButton("🧠 Learn")],
+        [KeyboardButton("📉 Performance"), KeyboardButton("📊 Strategies"),  KeyboardButton("🧠 Learn")],
         [KeyboardButton("💊 Health"),      KeyboardButton("🔧 Markets"),     KeyboardButton("🛑 Kill")],
     ],
     resize_keyboard=True,
@@ -303,6 +304,7 @@ class TelegramService(BaseService):
             "wallet_ui": self._cb_wallet_ui,
             "kill_switch": self._cb_kill_switch,
             "kill_confirm": self._cb_kill_confirm,
+            "kill_cancel": self._cb_kill_cancel,
         }
         handler = handlers.get(action)
         if handler:
@@ -375,7 +377,9 @@ class TelegramService(BaseService):
             brier  = self.ctx.learner._brier_score(closed)
             sharpe = self.ctx.learner._sharpe(pnls)
             rwr    = self.ctx.learner._rolling_win_rate(closed, 20)
-            pnl_vals = pnls or [0.0]
+            edges  = [t["edge"] for t in closed if t.get("edge") is not None]
+            avg_edge = sum(edges) / len(edges) if edges else 0.0
+            pnl_vals = pnls if pnls else [0.0]
             peak, running, max_dd = s["starting_balance"], s["starting_balance"], 0.0
             for p in pnls:
                 running += p
@@ -385,6 +389,7 @@ class TelegramService(BaseService):
                 max_dd = max(max_dd, dd)
             return {
                 "closed": len(closed), "brier": brier, "sharpe": sharpe, "rwr": rwr,
+                "avg_edge": avg_edge,
                 "avg_pnl": sum(pnls) / len(pnls) if pnls else 0.0,
                 "best":    max(pnl_vals), "worst": min(pnl_vals), "max_dd": max_dd,
             }, s
@@ -393,8 +398,7 @@ class TelegramService(BaseService):
         if r is None:
             text = "No closed trades yet."
         else:
-            from bot.telegram_bot import _format_pnl_card
-            text = _format_pnl_card(r, s)
+            text = format_pnl_card(r, s)
         await update.callback_query.edit_message_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
@@ -533,6 +537,12 @@ class TelegramService(BaseService):
             reply_markup=_inline_home_keyboard(self._is_admin(update)),
         )
 
+    async def _cb_kill_cancel(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.callback_query.edit_message_text(
+            "❌ Cancelled.",
+            reply_markup=_inline_home_keyboard(self._is_admin(update)),
+        )
+
     async def _cmd_start(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Primary entry: resume trading, restore both keyboards."""
         msg = update.message or update.effective_message
@@ -544,7 +554,7 @@ class TelegramService(BaseService):
                 self.ctx.state_store.update(enabled=True)
         # Re-establish the persistent reply keyboard
         await msg.reply_text(
-            "🚀 Bot active — use the keyboard below or the control panel:",
+            "✅ Bot and backend are running. Trading is active — use the keyboard below or the control panel.",
             reply_markup=KEYBOARD,
         )
         # Show inline control panel
@@ -636,29 +646,14 @@ class TelegramService(BaseService):
     async def _cmd_kill(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message or update.effective_message
         kb  = InlineKeyboardMarkup([[
-            InlineKeyboardButton("☠️ CONFIRM KILL", callback_data="kill_confirm"),
-            InlineKeyboardButton("❌ Cancel",        callback_data="kill_cancel"),
+            InlineKeyboardButton("☠️ CONFIRM KILL", callback_data="cb:kill_confirm"),
+            InlineKeyboardButton("❌ Cancel",        callback_data="cb:kill_cancel"),
         ]])
         await msg.reply_text(
             "🛑 *Emergency stop — confirm?*",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb,
         )
-
-    async def _cb_kill(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        await query.answer()
-        if query.data == "kill_confirm":
-            self.ctx.trading_active.clear()
-            if self.ctx.state_store is not None:
-                self.ctx.state_store.update(enabled=False)
-            self.ctx.record_error("Emergency stop by operator")
-            log.warning("emergency_stop", source="telegram")
-            await query.edit_message_text(
-                "☠️ Trading halted. Use /resume to restart."
-            )
-        else:
-            await query.edit_message_text("❌ Cancelled.")
 
     async def _cmd_positions(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         positions = await asyncio.to_thread(
@@ -747,6 +742,59 @@ class TelegramService(BaseService):
         report = await asyncio.to_thread(self.ctx.learner.build_report)
         for chunk in split_message(report):
             await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_strategies(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Strategy observer: virtual PnL per mode (conservative / default / aggressive)."""
+        obs = getattr(self.ctx, "strategy_observer", None)
+        if obs is None:
+            await update.message.reply_text("Strategy observer not running. Start with orchestrator.")
+            return
+        modes = await asyncio.to_thread(obs.get_leaderboard)
+        if not modes:
+            await update.message.reply_text("No strategy modes.")
+            return
+        lines = ["📊 *Strategy Leaderboard*\n"]
+        for m in modes:
+            pnl = m.get("total_pnl", 0)
+            emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+            wr = (m.get("win_rate") or 0) * 100
+            lines.append(
+                f"{emoji} *{m.get('label', m.get('id', '?'))}* — "
+                f"edge≥{m.get('min_edge', 0):.2f} kelly={m.get('kelly', 0):.2f}\n"
+                f"  PnL ${pnl:+.2f}  ·  {m.get('n_trades', 0)} trades  ·  {wr:.0f}% WR"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_retrain(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Force retrain calibration model on closed trades (50+ with features)."""
+        await update.message.reply_text("Retraining model…")
+        try:
+            from learning.retrain import maybe_retrain
+            metrics = await asyncio.to_thread(
+                maybe_retrain,
+                min_trades=50,
+                min_brier_to_trigger=0.0,
+                current_brier=None,
+                n_closed=None,
+            )
+            if metrics is None:
+                await update.message.reply_text("Not enough data (need 50+ closed trades with features).")
+                return
+            engine = getattr(self.ctx, "engine", None)
+            if engine is not None and hasattr(engine, "invalidate_model_cache"):
+                engine.invalidate_model_cache()
+            tb = metrics.get("train_brier", 0)
+            vb = metrics.get("val_brier")
+            vb_str = f"{vb:.4f}" if isinstance(vb, (int, float)) else str(vb or "N/A")
+            n = metrics.get("n_train", 0)
+            await update.message.reply_text(
+                f"✅ *Model retrained*\n\n"
+                f"Train Brier: {tb:.4f}  ·  Val Brier: {vb_str}\n"
+                f"n={n} samples",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"Retrain failed: {exc}")
 
     async def _cmd_params(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         p    = await asyncio.to_thread(self.ctx.engine.get_adaptive_params)
@@ -905,6 +953,7 @@ class TelegramService(BaseService):
             "📋 Positions":    self._cmd_positions,
             "📈 Trades":       self._cmd_trades,
             "📉 Performance":  self._cmd_performance,
+            "📊 Strategies":   self._cmd_strategies,
             "🌡 Sentiment":    self._cmd_sentiment,
             "🧠 Learn":        self._cmd_learn,
             "⚙ Params":        self._cmd_params,
@@ -932,9 +981,6 @@ class TelegramService(BaseService):
         add(CallbackQueryHandler(
             self._wrap(self._cb_reset), pattern="^reset_(confirm|cancel)$"
         ))
-        add(CallbackQueryHandler(
-            self._wrap(self._cb_kill), pattern="^kill_(confirm|cancel)$"
-        ))
         add(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._wrap(self._handle_keyboard),
@@ -950,6 +996,8 @@ class TelegramService(BaseService):
             ("trades",       self._cmd_trades),
             ("performance",  self._cmd_performance),
             ("learn",        self._cmd_learn),
+            ("strategies",   self._cmd_strategies),
+            ("retrain",      self._cmd_retrain),
             ("params",       self._cmd_params),
             ("sentiment",    self._cmd_sentiment),
             ("wallets",      self._cmd_wallets),

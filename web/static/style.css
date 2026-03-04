@@ -63,8 +63,14 @@ html, body {
   text-rendering: optimizeLegibility;
 }
 
+/* Drag state: show resize cursor and prevent text selection */
+body.panel-resize-vertical { cursor: ns-resize; user-select: none; }
+body.panel-resize-horizontal { cursor: col-resize; user-select: none; }
+
 #app {
+  min-height: 100dvh;
   height: 100dvh;
+  max-height: 100dvh;
   width: 100%;
   display: flex;
   flex-direction: row;
@@ -142,6 +148,7 @@ html, body {
 .main-content {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: var(--gap);
@@ -153,7 +160,7 @@ html, body {
 .pages-wrap {
   flex: 1;
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
   display: flex;
   flex-direction: column;
 }
@@ -164,7 +171,7 @@ html, body {
   flex-direction: column;
   gap: var(--gap);
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
 }
 
 .page.active { display: flex; }
@@ -448,12 +455,14 @@ html, body {
 .leg-l { color: var(--red); }
 
 /* ── Dashboard 2-column Trading Terminal Grid ─────────────────────────────── */
+/* ── Dashboard 2-column Trading Terminal Grid ─────────────────────────────── */
 .dash-grid {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: 62% 38%;
-  gap: var(--gap);
+  max-height: 100%;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
   overflow: hidden;
 }
 
@@ -465,27 +474,115 @@ html, body {
   overflow: hidden;
 }
 
-/* Charts column: BTC chart takes most space */
-.charts-col .chart-main {
-  flex: 1;
-  min-height: 0;
+#dash-charts-col {
+  flex: 1 1 62%;
+  min-width: 280px;
+  max-width: 85%;
 }
 
-/* Orders column: positions fixed height, feed fills rest */
+#dash-orders-col {
+  flex: 1 1 38%;
+  min-width: 220px;
+  max-width: 70%;
+}
+
+.dash-splitter {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: var(--border);
+  margin: 0 2px;
+  position: relative;
+}
+.dash-splitter:hover,
+.dash-splitter.dragging { background: var(--amber); }
+.dash-splitter::after {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 12px;
+  margin-left: -3px;
+  cursor: col-resize;
+}
+
+/* Charts column: chart panel uses flex, can be resized via handle */
+.charts-col .chart-main {
+  flex: 1 1 0;
+  min-height: 200px;
+  max-height: 80vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.charts-col .chart-main .chart-body {
+  flex: 1;
+  min-height: 200px;
+}
+
+/* Orders column: panels use flex; heights set by resize or default */
 .orders-col .panel-pos-mini {
   flex: 0 0 150px;
-  height: 150px;
+  min-height: 80px;
+  display: flex;
+  flex-direction: column;
 }
+.orders-col .panel-pos-mini .tscroll { flex: 1; min-height: 0; overflow: auto; }
 
-/* Bottom row under BTC chart: equity + perf side by side */
+/* Bottom row under BTC chart: equity | splitter | perf */
 .dash-row-split {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--gap);
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 0;
   flex: 0 0 var(--chart-h);
   min-height: 0;
 }
-.dash-row-split .panel { min-height: 0; }
+.dash-row-split .panel { min-height: 0; flex: 1 1 0; }
+.dash-row-split #panel-equity { min-width: 140px; }
+.dash-row-split #panel-perf { min-width: 120px; }
+
+.row-splitter {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: var(--border);
+  position: relative;
+}
+.row-splitter:hover,
+.row-splitter.dragging { background: var(--amber); }
+.row-splitter::after {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 12px;
+  margin-left: -3px;
+  cursor: col-resize;
+}
+
+/* Panel resize handle — draggable bottom edge */
+.panel-resize-handle {
+  flex: 0 0 6px;
+  min-height: 6px;
+  cursor: ns-resize;
+  background: var(--border);
+  border-top: 1px solid var(--border-hi);
+  transition: background .12s;
+  user-select: none;
+}
+.panel-resize-handle:hover,
+.panel-resize-handle.dragging {
+  background: var(--amber-dim);
+  border-top-color: var(--amber);
+}
+.panel-resize-handle::after {
+  content: '⋯';
+  display: block;
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--muted);
+  line-height: 6px;
+}
+.panel-resize-handle:hover::after,
+.panel-resize-handle.dragging::after { color: var(--amber); }
 
 /* Performance panel in the split row */
 .panel-perf-inline {
@@ -496,9 +593,10 @@ html, body {
 }
 .panel-perf-inline .perf-body { overflow-y: auto; flex: 1; }
 
-/* Main BTC chart — fills column */
+/* Main BTC chart — bounded, resizable */
 .chart-main {
-  min-height: 240px;
+  min-height: 200px;
+  max-height: 80vh;
 }
 
 /* Fixed-height chart panels */
@@ -514,14 +612,34 @@ html, body {
   display: flex;
   flex-direction: column;
 }
+.panel-flex .activity-feed { flex: 1; min-height: 0; }
 
 /* Fixed-height trade grid at bottom of orders column */
 .grid-sm {
   flex: 0 0 var(--grid-h);
-  height: var(--grid-h);
+  min-height: 50px;
+  display: flex;
+  flex-direction: column;
 }
+.grid-sm .tgrid-wrap { flex: 1; min-height: 0; overflow: auto; }
 
-/* Chart body */
+/* Resizable panels: use handle; no native resize to avoid double UI */
+.resizable-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.resizable-panel .chart-body,
+.resizable-panel .tscroll,
+.resizable-panel .perf-body { flex: 1; min-height: 0; }
+.chart-main.resizable-panel .chart-body { flex: 1; min-height: 120px; }
+.panel-flex.resizable-panel { min-height: 120px; }
+.panel-pos-mini.resizable-panel { min-height: 80px; }
+.grid-sm.resizable-panel { min-height: 50px; }
+.chart-sm.resizable-panel { min-height: 120px; }
+.panel-perf-inline.resizable-panel { min-height: 100px; min-width: 140px; }
+
+/* Chart body (content area inside panel) */
 .chart-body {
   flex: 1;
   min-height: 0;
@@ -529,6 +647,21 @@ html, body {
   position: relative;
   overflow: hidden;
 }
+.chart-body.chart-body-tv {
+  min-height: 200px;
+  overflow: hidden;
+  flex: 1;
+}
+
+/* Grey out closed orders in activity feed */
+.act-card.act-closed {
+  opacity: 0.72;
+  filter: grayscale(0.5);
+  background: var(--bg-row-alt);
+}
+.act-card.act-closed .act-card-title,
+.act-card.act-closed .act-card-direction,
+.act-card.act-closed .act-card-shares { color: var(--muted); }
 
 /* ── Activity Feed ────────────────────────────────────────────────────────── */
 .activity-feed {
@@ -572,6 +705,81 @@ html, body {
 .act-size { font-weight: 600; flex-shrink: 0; color: var(--text-hi); }
 .act-pnl  { font-weight: 700; flex-shrink: 0; }
 .act-val  { font-size: 8px; color: var(--muted); flex-shrink: 0; }
+
+/* ── Activity cards (trader-card style with timestamp) ───────────────────────── */
+.activity-feed .act-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 9px;
+}
+.activity-feed .act-card:last-child { margin-bottom: 0; }
+.act-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+.act-card-badge {
+  font-size: 7px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin-right: 6px;
+}
+.act-card-badge.open { color: var(--green); }
+.act-card-badge.won  { color: var(--green); }
+.act-card-badge.lost  { color: var(--red); }
+.act-card-ts {
+  font-size: 8px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 2px;
+}
+.act-card-title {
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.3;
+  margin-bottom: 2px;
+}
+.act-card-direction {
+  font-weight: 600;
+  font-size: 12px;
+}
+.act-card-direction.down { color: var(--red); }
+.act-card-direction.up   { color: var(--green); }
+.act-card-shares {
+  font-size: 10px;
+  color: var(--text);
+}
+.act-card-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+}
+.act-card-bar .current { color: var(--text-hi); }
+.act-card-bar .max     { color: var(--muted); }
+.act-card-value {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
+}
+.act-card-value .position { font-weight: 600; color: var(--text-hi); }
+.act-card-value .pnl      { font-weight: 500; }
+.act-card-value .pnl.pos,
+.act-card-value .pnl.positive { color: var(--green); }
+.act-card-value .pnl.negative { color: var(--red); }
 
 /* ── Mini Positions Table (inside dashboard left panel) ───────────────────── */
 .mini-tbl {
@@ -920,6 +1128,19 @@ tr:hover td { background: var(--bg-hover) !important; }
 }
 .cbtn.secondary:hover { border-color: var(--amber); color: var(--amber); }
 
+.learn-toolbar { padding: 4px 0 6px; }
+.btn-retrain {
+  padding: 4px 10px;
+  font-family: var(--font);
+  font-size: 10px;
+  background: var(--amber-dim);
+  color: var(--amber);
+  border: 1px solid rgba(243,127,17,.4);
+  cursor: pointer;
+}
+.btn-retrain:hover { background: rgba(243,127,17,.2); }
+.btn-retrain:disabled { opacity: 0.6; cursor: not-allowed; }
+
 .cmd-actions { flex-wrap: wrap; gap: 3px; }
 
 input[type="number"] {
@@ -999,6 +1220,7 @@ input[type="number"]:focus { border-color: var(--amber); }
 .chart-ph-right {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 7px;
 }
 
@@ -1031,6 +1253,93 @@ input[type="number"]:focus { border-color: var(--amber); }
   color: var(--amber);
   border-color: rgba(243,127,17,.45);
   background: var(--amber-dim);
+}
+
+/* ── Timeframe Switcher ─────────────────────────────────────────────────────── */
+.tf-switcher {
+  display: flex;
+  gap: 1px;
+}
+
+.tf-btn {
+  padding: 1px 4px;
+  font-size: 7px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-family: var(--font);
+  cursor: pointer;
+  transition: color .1s, border-color .1s, background .1s;
+}
+
+.tf-btn:hover {
+  color: var(--amber);
+  border-color: rgba(243,127,17,.35);
+}
+
+.tf-btn.active {
+  color: var(--amber);
+  border-color: rgba(243,127,17,.45);
+  background: var(--amber-dim);
+}
+
+/* ── Chart view switcher (Lightweight vs TradingView) ───────────────────────── */
+.chart-view-switcher { display: flex; gap: 1px; }
+.view-btn {
+  padding: 1px 4px;
+  font-size: 7px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-family: var(--font);
+  cursor: pointer;
+  transition: color .1s, border-color .1s, background .1s;
+}
+.view-btn:hover {
+  color: var(--cyan);
+  border-color: rgba(34,211,238,.35);
+}
+.view-btn.active {
+  color: var(--cyan);
+  border-color: rgba(34,211,238,.45);
+  background: rgba(34,211,238,.12);
+}
+
+/* ── Indicator Bar ────────────────────────────────────────────────────────── */
+.indicator-bar {
+  display: flex;
+  gap: 1px;
+}
+
+.ind-btn {
+  padding: 1px 4px;
+  font-size: 7px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-family: var(--font);
+  cursor: pointer;
+  transition: color .1s, border-color .1s, background .1s;
+}
+
+.ind-btn:hover {
+  color: var(--cyan);
+  border-color: rgba(34,211,238,.35);
+}
+
+.ind-btn.active {
+  color: var(--cyan);
+  border-color: rgba(34,211,238,.45);
+  background: rgba(34,211,238,.12);
 }
 
 /* ── Feed Status Badge ────────────────────────────────────────────────────── */
@@ -1171,3 +1480,78 @@ kbd {
   font-size: 7px;
   padding: 0 2px;
 }
+
+/* ── Tracked Trader page (wallet observer cards) ─────────────────────────────── */
+.trader-profile {
+  padding: var(--pad) 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.tp-label {
+  font-weight: 600;
+  color: var(--text-hi);
+  font-size: 12px;
+}
+.tp-meta {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.trader-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  padding: 8px;
+  overflow-y: auto;
+  max-height: calc(100vh - 180px);
+}
+.trader-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.trader-card .tc-icon {
+  font-size: 14px;
+  margin-bottom: 2px;
+}
+.trader-card .tc-title {
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.35;
+  margin-bottom: 4px;
+}
+.trader-card .tc-direction {
+  font-weight: 600;
+  font-size: 13px;
+}
+.trader-card .tc-direction.down { color: var(--red); }
+.trader-card .tc-direction.up   { color: var(--green); }
+.trader-card .tc-shares {
+  font-size: 11px;
+  color: var(--text);
+}
+.trader-card .tc-price-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.trader-card .tc-price-bar .current { color: var(--text-hi); }
+.trader-card .tc-price-bar .max    { color: var(--muted); }
+.trader-card .tc-value-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 11px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.trader-card .tc-position-usd { font-weight: 600; color: var(--text-hi); }
+.trader-card .tc-pnl { font-weight: 500; }
+.trader-card .tc-pnl.positive { color: var(--green); }
+.trader-card .tc-pnl.negative { color: var(--red); }
+.trader-card .tc-pnl.neutral  { color: var(--muted); }

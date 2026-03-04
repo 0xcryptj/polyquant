@@ -24,6 +24,8 @@
     <button class="nav-btn" data-view="trades" title="Trade History">TRADES</button>
     <button class="nav-btn" data-view="performance" title="Performance Metrics">PERF</button>
     <button class="nav-btn" data-view="sentiment" title="Market Intelligence">INTEL</button>
+    <button class="nav-btn" data-view="trader" title="Tracked Trader">TRADER</button>
+    <button class="nav-btn" data-view="strategies" title="Strategy modes">STRAT</button>
     <button class="nav-btn" data-view="controls" title="System Controls">CTRL</button>
   </nav>
 
@@ -130,28 +132,31 @@
 
         <!-- 2-Column Trading Terminal Grid -->
         <div class="dash-grid">
-
-          <!-- ── Left Column: Charts (65%) ──────────────────── -->
-          <div class="dash-col charts-col">
-            <!-- BTC candlestick chart — main chart -->
-            <div class="panel chart-main" aria-label="BTC price chart">
+          <div class="dash-col charts-col" id="dash-charts-col">
+            <div class="panel chart-main resizable-panel" id="panel-chart" data-resize-min="200" data-resize-max="1200">
               <div class="ph">
-                <span class="ph-title" id="chart-sym-title">BTC / USD  <span class="ph-sub">1s live</span></span>
+                <span class="ph-title" id="chart-sym-title">BTC / USD  <span class="ph-sub">1m</span></span>
                 <div class="chart-ph-right">
                   <div class="sym-switcher" role="group" aria-label="Symbol">
                     <button class="sym-btn active" data-sym="btc" title="BTC/USDT  [key 1]">BTC</button>
                     <button class="sym-btn" data-sym="eth" title="ETH/USDT  [key 2]">ETH</button>
                     <button class="sym-btn" data-sym="sol" title="SOL/USDT  [key 3]">SOL</button>
                   </div>
-                  <span class="feed-badge" id="feed-status" title="Live feed status">INIT</span>
-                  <span class="ph-badge" id="btc-badge">—</span>
+                  <div class="tf-switcher" role="group" aria-label="Timeframe">
+                    <button class="tf-btn active" data-tf="1m">1m</button>
+                    <button class="tf-btn" data-tf="5m">5m</button>
+                    <button class="tf-btn" data-tf="15m">15m</button>
+                    <button class="tf-btn" data-tf="1h">1h</button>
+                  </div>
+                  <span class="ph-badge" id="chart-price-badge" aria-label="Chart symbol price">—</span>
                 </div>
               </div>
-              <div class="chart-body" id="btc-chart-wrap"></div>
+              <div class="chart-body chart-body-tv" id="tradingview-chart-wrap"></div>
+              <div class="panel-resize-handle" data-resize="panel-chart" title="Drag to resize; double-click to reset" aria-label="Resize chart"></div>
             </div>
             <!-- Equity + Performance row -->
-            <div class="dash-row-split">
-              <div class="panel chart-sm" aria-label="Equity curve">
+            <div class="dash-row-split" id="row-equity-perf">
+              <div class="panel chart-sm resizable-panel" id="panel-equity" data-resize-min="120" data-resize-max="480">
                 <div class="ph">
                   <span class="ph-title">EQUITY</span>
                   <span class="ph-badge" id="pnl-badge">—</span>
@@ -159,8 +164,10 @@
                 <div class="chart-body">
                   <canvas id="pnl-chart"></canvas>
                 </div>
+                <div class="panel-resize-handle" data-resize="panel-equity" title="Drag to resize; double-click to reset" aria-label="Resize equity"></div>
               </div>
-              <div class="panel panel-perf-inline" aria-label="Performance metrics">
+              <div class="row-splitter" id="splitter-equity-perf" title="Drag to resize columns"></div>
+              <div class="panel panel-perf-inline resizable-panel" id="panel-perf" data-resize-min="100" data-resize-max="400">
                 <div class="ph"><span class="ph-title">PERFORMANCE</span></div>
                 <div class="perf-body">
                   <div class="prow"><span class="pk">SHARPE</span><span class="pv" id="pv-sharpe">—</span></div>
@@ -170,14 +177,15 @@
                   <div class="prow"><span class="pk">AVG P&amp;L</span><span class="pv" id="pv-apnl">—</span></div>
                   <div class="prow"><span class="pk">MARKETS</span><span class="pv" id="pv-markets">—</span></div>
                 </div>
+                <div class="panel-resize-handle" data-resize="panel-perf" title="Drag to resize; double-click to reset" aria-label="Resize performance"></div>
               </div>
             </div>
           </div>
-
-          <!-- ── Right Column: Orders & Positions (35%) ─────── -->
-          <div class="dash-col orders-col">
+          <div class="dash-splitter" id="dash-splitter" title="Drag to resize columns"></div>
+          <!-- ── Right Column: Orders & Positions ─────── -->
+          <div class="dash-col orders-col" id="dash-orders-col">
             <!-- Open positions -->
-            <div class="panel panel-pos-mini" aria-label="Open positions">
+            <div class="panel panel-pos-mini resizable-panel" id="panel-positions" data-resize-min="80" data-resize-max="400">
               <div class="ph">
                 <span class="ph-title">POSITIONS</span>
                 <span class="ph-count" id="pos-count">0</span>
@@ -192,9 +200,10 @@
                   </tbody>
                 </table>
               </div>
+              <div class="panel-resize-handle" data-resize="panel-positions" title="Drag to resize; double-click to reset" aria-label="Resize positions"></div>
             </div>
-            <!-- Orders & Outcomes feed — full remaining height -->
-            <div class="panel panel-flex" aria-label="Orders and outcomes" role="log">
+            <!-- Orders & Outcomes feed — resizable -->
+            <div class="panel panel-flex resizable-panel" id="panel-activity" data-resize-min="120" data-resize-max="800">
               <div class="ph">
                 <span class="ph-title">ORDERS &amp; OUTCOMES</span>
                 <span class="ph-count" id="activity-count">0</span>
@@ -202,14 +211,16 @@
               <div class="activity-feed tscroll" id="activity-feed" aria-live="polite">
                 <div class="empty" id="activity-placeholder">Loading…</div>
               </div>
+              <div class="panel-resize-handle" data-resize="panel-activity" title="Drag to resize; double-click to reset" aria-label="Resize orders"></div>
             </div>
             <!-- Win/loss grid -->
-            <div class="panel grid-sm" aria-label="Win/loss grid">
+            <div class="panel grid-sm resizable-panel" id="panel-grid" data-resize-min="50" data-resize-max="280">
               <div class="ph">
                 <span class="ph-title">WIN / LOSS</span>
                 <span class="ph-legend"><span class="leg-w">■</span> W <span class="leg-l">■</span> L</span>
               </div>
               <div class="tgrid-wrap" id="trade-grid"></div>
+              <div class="panel-resize-handle" data-resize="panel-grid" title="Drag to resize; double-click to reset" aria-label="Resize grid"></div>
             </div>
           </div>
 
@@ -303,8 +314,55 @@
           </div>
           <div class="insights-body">
             <div class="insight-pane active" id="pane-sentiment"><pre id="insight-sentiment">—</pre></div>
-            <div class="insight-pane" id="pane-learn"><pre id="insight-learn">—</pre></div>
+            <div class="insight-pane" id="pane-learn">
+              <div class="learn-toolbar">
+                <button type="button" class="btn-retrain" id="btn-retrain" title="Retrain calibration model on trade outcomes (50+ trades)">🔄 Retrain Model</button>
+              </div>
+              <pre id="insight-learn">—</pre>
+            </div>
             <div class="insight-pane" id="pane-wallets"><pre id="insight-wallets">—</pre></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: TRACKED TRADER — wallet observer position cards
+           ════════════════════════════════════════════════════════ -->
+      <div class="page" id="page-trader">
+        <div class="panel full-page-panel">
+          <div class="ph">
+            <span class="ph-title">TRACKED TRADER</span>
+            <span class="ph-count" id="trader-pos-count">0</span>
+          </div>
+          <div class="trader-profile" id="trader-profile">
+            <div class="tp-label" id="trader-label">—</div>
+            <div class="tp-meta"><span id="trader-strategy">—</span> · WR <span id="trader-wr">—</span> · PnL <span id="trader-total-pnl">—</span> · <span id="trader-n-trades">—</span> trades</div>
+          </div>
+          <div class="trader-cards" id="trader-cards">
+            <div class="empty" id="trader-cards-empty">No tracked traders or no open positions. Add wallets in <code>wallets_to_watch.txt</code>.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════════════════════════════════════════════════
+           PAGE: STRATEGY OBSERVER — mode leaderboard
+           ════════════════════════════════════════════════════════ -->
+      <div class="page" id="page-strategies">
+        <div class="panel full-page-panel">
+          <div class="ph">
+            <span class="ph-title">STRATEGY OBSERVER</span>
+            <span class="ph-sub">Modes run concurrently (shadow); best PnL wins</span>
+          </div>
+          <div class="tscroll">
+            <table>
+              <thead><tr>
+                <th>MODE</th><th>MIN EDGE</th><th>KELLY</th><th>BALANCE</th>
+                <th>P&amp;L</th><th>TRADES</th><th>WIN RATE</th>
+              </tr></thead>
+              <tbody id="strategies-body">
+                <tr><td colspan="7" class="empty">Loading…</td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -403,7 +461,6 @@
 </div><!-- /#app -->
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="/static/app.js" defer></script>
 </body>
 </html>

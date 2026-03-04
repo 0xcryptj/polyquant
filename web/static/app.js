@@ -2,7 +2,7 @@
  * PolyQuant Terminal — Bloomberg-style live dashboard
  *
  * Modules:
- *   CandleBuilder  — pure 1-second OHLCV aggregator (unit-testable, no DOM)
+ *   FeedManager/ChartState — symbol + timeframe state; TradingView widget only
  *   FeedManager    — Binance WebSocket with auto-reconnect + status badge
  *   CommandPalette — overlay palette (/ to open, ↑↓ navigate, ↵ run)
  *   KeyboardShortcuts — global bindings (1/2/3 symbols, D/P/T/F/I/C pages)
@@ -88,9 +88,13 @@ function fmtTs(iso) {
 }
 
 // ── API fetch ─────────────────────────────────────────────────────────────────
+// Use same origin when served over http(s); fallback for file:// so data can load
+const _apiBase = (typeof window !== 'undefined' && /^https?:/.test(window.location?.protocol || ''))
+  ? '' : (window.__POLYQUANT_API__ || 'http://127.0.0.1:8080');
 
 async function apiFetch(path, { silent = false } = {}) {
-  const r = await fetch('/api' + path);
+  const url = _apiBase + '/api' + path;
+  const r = await fetch(url);
   if (!r.ok) {
     if (!silent) console.warn(`API ${path} failed: ${r.status}`);
     throw new Error(`${r.status} ${path}`);
@@ -98,214 +102,42 @@ async function apiFetch(path, { silent = false } = {}) {
   return r.json();
 }
 
-// ── Chart & Feed state (declared early so FeedManager can reference them) ─────
+// ── Chart state (symbol + timeframe for TradingView only) ────────────────────
+let _pnlChart = null;
 
-let _pnlChart        = null;  // Chart.js equity curve
-let _btcLwChart      = null;  // TradingView Lightweight Charts (OHLCV)
-let _btcChart        = null;  // Chart.js BTC fallback
-let _feedInitialized = false; // true once FeedManager.connect() called
+const ChartState = (() => {
+  let _sym = 'btc';
+  let _tf = '1m';
 
-// ── CandleBuilder — pure 1-second OHLCV aggregator ────────────────────────────
-/**
- * @typedef {{ time: number, open: number, high: number, low: number, close: number, volume: number }} OHLCCandle
- */
-const CandleBuilder = (() => {
-  /** @type {Map<number, OHLCCandle>} */
-  const _store = new Map();
-
-  /**
-   * Process a raw Binance trade tick into a 1-second OHLCV candle.
-   * @param {{ T: number, p: string, q: string }} tick  Binance trade message
-   * @returns {{ candle: OHLCCandle, isNew: boolean }}
-   */
-  function processTick(tick) {
-    const price = parseFloat(tick.p);
-    const qty   = parseFloat(tick.q);
-    const key   = Math.floor(tick.T / 1000); // 1-second bucket = LightweightCharts unix time
-    const isNew = !_store.has(key);
-    if (isNew) {
-      _store.set(key, { time: key, open: price, high: price, low: price, close: price, volume: qty });
-    } else {
-      const c = _store.get(key);
-      if (price > c.high) c.high = price;
-      if (price < c.low)  c.low  = price;
-      c.close   = price;
-      c.volume += qty;
-    }
-    return { candle: _store.get(key), isNew };
-  }
-
-  /**
-   * Seed with historical REST candles: [{t: ms, o, h, l, c}, ...]
-   * @param {Array<{t:number,o:number,h:number,l:number,c:number}>} restCandles
-   */
-  function seed(restCandles) {
-    _store.clear();
-    restCandles.forEach(c => {
-      const key = Math.floor(c.t / 1000);
-      _store.set(key, { time: key, open: c.o, high: c.h, low: c.l, close: c.c, volume: 0 });
-    });
-  }
-
-  /** @returns {OHLCCandle[]} All candles sorted ascending by time */
-  function getAll() {
-    return Array.from(_store.values()).sort((a, b) => a.time - b.time);
-  }
-
-  /** Prune oldest candles, keeping at most `maxLen`. */
-  function trim(maxLen = 600) {
-    if (_store.size <= maxLen) return;
-    const keys = Array.from(_store.keys()).sort((a, b) => a - b);
-    keys.slice(0, _store.size - maxLen).forEach(k => _store.delete(k));
-  }
-
-  function clear() { _store.clear(); }
-
-  return { processTick, seed, getAll, trim, clear };
-})();
-
-// ── FeedManager — Binance WebSocket with auto-reconnect ───────────────────────
-/**
- * @typedef {'LIVE'|'RECONNECTING'|'STALE'|'DISCONNECTED'} FeedStatus
- */
-const FeedManager = (() => {
-  const SYMBOLS    = { btc: 'btcusdt', eth: 'ethusdt', sol: 'solusdt' };
-  const WS_BASE    = 'wss://stream.binance.com:9443/ws';
-  const STATUS_CLR = {
-    LIVE:         '#22c55e',
-    RECONNECTING: '#f79e0b',
-    STALE:        '#ef4444',
-    DISCONNECTED: '#475569',
-  };
-
-  let _sym        = 'btc';
-  let _ws         = null;
-  /** @type {FeedStatus} */
-  let _status     = 'DISCONNECTED';
-  let _retryDelay = 1500;
-  let _retryTimer = null;
-  let _staleTimer = null;
-
-  function _setStatus(s) {
-    _status = s;
-    const el = document.getElementById('feed-status');
-    if (el) { el.textContent = s; el.style.color = STATUS_CLR[s] || '#475569'; }
-  }
-
-  function _resetStaleTimer() {
-    clearTimeout(_staleTimer);
-    _staleTimer = setTimeout(() => _setStatus('STALE'), 12000); // 12s no trades = stale
-  }
-
-  function _openWs() {
-    const binanceSym = SYMBOLS[_sym] || 'btcusdt';
-    _setStatus('RECONNECTING');
-    try {
-      _ws = new WebSocket(`${WS_BASE}/${binanceSym}@trade`);
-    } catch (_) { _scheduleRetry(); return; }
-
-    _ws.onopen = () => {
-      _retryDelay = 1500; // reset backoff on success
-      _setStatus('LIVE');
-      _resetStaleTimer();
-    };
-
-    _ws.onmessage = ev => {
-      _resetStaleTimer();
-      if (_status !== 'LIVE') _setStatus('LIVE');
-      try {
-        const tick = JSON.parse(ev.data);
-        if (!tick || tick.e !== 'trade') return;
-        const { candle } = CandleBuilder.processTick(tick);
-        CandleBuilder.trim(600);
-        // Push live update to LightweightCharts (O(1), no full redraw)
-        if (_btcLwChart && _btcLwChart._candleSeries) {
-          _btcLwChart._candleSeries.update(candle);
-        }
-        // Update price badge and ticker
-        const ps = candle.close.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        const badge = document.getElementById('btc-badge');
-        if (badge) badge.textContent = `$${ps}`;
-        const tp = document.getElementById('t-btc-price');
-        if (tp && _sym === 'btc') tp.textContent = `$${ps}`;
-      } catch (_) { /* malformed tick */ }
-    };
-
-    _ws.onerror = () => { /* followed by onclose */ };
-
-    _ws.onclose = ev => {
-      clearTimeout(_staleTimer);
-      if (!ev.wasClean || ev.code !== 1000) _scheduleRetry();
-      else _setStatus('DISCONNECTED');
-    };
-  }
-
-  function _scheduleRetry() {
-    _setStatus('RECONNECTING');
-    clearTimeout(_retryTimer);
-    _retryTimer = setTimeout(() => {
-      _retryDelay = Math.min(_retryDelay * 2, 30000);
-      _openWs();
-    }, _retryDelay);
-  }
-
-  function _teardown() {
-    clearTimeout(_retryTimer);
-    clearTimeout(_staleTimer);
-    if (_ws) {
-      _ws.onclose = null; _ws.onerror = null; _ws.onmessage = null;
-      try { _ws.close(1000, 'switching'); } catch (_) {}
-      _ws = null;
-    }
-  }
-
-  async function _seedChart(sym) {
-    try {
-      const symMap = { btc: 'BTC/USDT', eth: 'ETH/USDT', sol: 'SOL/USDT' };
-      const symParam = encodeURIComponent(symMap[sym] || 'BTC/USDT');
-      const r = await fetch(`/api/btc-chart?limit=400&symbol=${symParam}`);
-      if (!r.ok) return;
-      const candles = await r.json();
-      if (candles && candles.length) {
-        CandleBuilder.seed(candles);
-        if (_btcLwChart && _btcLwChart._candleSeries) {
-          _btcLwChart._candleSeries.setData(CandleBuilder.getAll());
-          _btcLwChart.timeScale().fitContent();
-        }
-      }
-    } catch (_) { /* seed errors are non-fatal */ }
-  }
-
-  /** Connect (or reconnect) to the given symbol's WebSocket feed. */
-  function connect(sym) {
-    if (sym) _sym = sym;
-    _teardown();
-    CandleBuilder.clear();
-    _setStatus('RECONNECTING');
-    _seedChart(_sym).then(() => _openWs());
-  }
-
-  /** Switch to a different trading symbol. */
-  function switchSymbol(sym) {
-    if (!SYMBOLS[sym]) return;
-    if (sym === _sym) { showPage('dashboard'); return; }
-    _sym = sym;
-    const label = sym.toUpperCase();
+  function _updateTitle() {
     const titleEl = document.getElementById('chart-sym-title');
-    if (titleEl) titleEl.innerHTML = `${label} / USD  <span class="ph-sub">1s live</span>`;
-    document.querySelectorAll('.sym-btn').forEach(b => b.classList.toggle('active', b.dataset.sym === sym));
-    const badge = document.getElementById('btc-badge');
-    if (badge) badge.textContent = '—';
-    connect(sym);
-    showPage('dashboard');
+    if (titleEl) titleEl.innerHTML = `${_sym.toUpperCase()} / USD  <span class="ph-sub">${_tf}</span>`;
+    document.querySelectorAll('.sym-btn').forEach(b => b.classList.toggle('active', (b.dataset.sym || 'btc') === _sym));
+    document.querySelectorAll('.tf-btn').forEach(b => b.classList.toggle('active', (b.dataset.tf || '1m') === _tf));
   }
 
-  function reconnect() { connect(); }
-  function getStatus() { return _status; }
-  function getSymbol() { return _sym; }
+  function switchSymbol(sym) {
+    if (!['btc', 'eth', 'sol'].includes(sym)) return;
+    if (sym === _sym) return;
+    _sym = sym;
+    _updateTitle();
+    if (typeof TradingViewWidget !== 'undefined') TradingViewWidget.load(_sym, _tf);
+    if (typeof updateChartPriceBadge === 'function') updateChartPriceBadge();
+  }
 
-  return { connect, switchSymbol, reconnect, getStatus, getSymbol };
+  function switchTimeframe(tf) {
+    if (!['1m', '5m', '15m', '1h'].includes(tf)) return;
+    if (tf === _tf) return;
+    _tf = tf;
+    _updateTitle();
+    if (typeof TradingViewWidget !== 'undefined') TradingViewWidget.load(_sym, _tf);
+  }
+
+  return { getSymbol: () => _sym, getTimeframe: () => _tf, switchSymbol, switchTimeframe };
 })();
+
+// Alias for code that still references FeedManager
+const FeedManager = ChartState;
 
 // ── Clock & Countdown ─────────────────────────────────────────────────────────
 
@@ -342,6 +174,8 @@ const CommandPalette = (() => {
     { id: 'trades',    label: 'Trade history',       keys: ['trades','t'],    action: () => showPage('trades') },
     { id: 'perf',      label: 'Performance',         keys: ['perf','f'],      action: () => showPage('performance') },
     { id: 'intel',     label: 'Market intelligence', keys: ['intel','i'],     action: () => showPage('sentiment') },
+    { id: 'trader',    label: 'Tracked trader',       keys: ['trader','o'],    action: () => showPage('trader') },
+    { id: 'strategies', label: 'Strategy observer',   keys: ['strategies','s'], action: () => showPage('strategies') },
     { id: 'ctrl',      label: 'System controls',     keys: ['ctrl','c'],      action: () => showPage('controls') },
   ];
 
@@ -474,6 +308,8 @@ document.addEventListener('keydown', e => {
     case 't': case 'T': showPage('trades');      break;
     case 'f': case 'F': showPage('performance'); break;
     case 'i': case 'I': showPage('sentiment');   break;
+    case 'o': case 'O': showPage('trader');      break;
+    case 's': case 'S': showPage('strategies');  break;
     case 'c': case 'C': showPage('controls');    break;
   }
 });
@@ -487,7 +323,78 @@ function setCard(id, val, sub, cls) {
   if (s) { s.textContent = sub; s.className = `mc-sub${cls ? ' ' + cls : ''}`; }
 }
 
+/** Render one activity item (open or closed) as a card: market title, timestamp, direction + cents, shares, price bar, value row. */
+function renderActivityCard(it) {
+  const d_ = fmtDir(it.direction);
+  const dirCls = d_.toLowerCase() === 'down' ? 'down' : 'up';
+  const title = esc(it.market_title || it.market || 'Polymarket BTC 5m');
+  const ts = it.type === 'open'
+    ? (it.opened_at ? 'Opened ' + fmtTs(it.opened_at) : '')
+    : (it.resolved_at ? 'Resolved ' + fmtTs(it.resolved_at) : '');
+  const outcomeLabel = it.type === 'open' ? 'OPEN' : ((it.status || '').toLowerCase() === 'won' ? 'WON' : 'LOST');
+  const outcomeCls = it.type === 'open' ? 'open' : (it.status || '').toLowerCase() === 'won' ? 'won' : 'lost';
+
+  if (it.type === 'open') {
+    const cents = it.entry_price_cents != null ? it.entry_price_cents : (it.entry_price != null ? Math.round(it.entry_price * 100 * 10) / 10 : '—');
+    const shares = it.shares != null ? it.shares.toLocaleString(undefined, { maximumFractionDigits: 1 }) : '—';
+    const toWin = it.to_win != null ? `to win $${Number(it.to_win).toFixed(2)}` : '';
+    return (
+      '<div class="act-card act-open">' +
+      '<div class="act-card-head">' +
+      '<span class="act-card-badge ' + outcomeCls + '">' + outcomeLabel + '</span>' +
+      (ts ? '<span class="act-card-ts">' + esc(ts) + '</span>' : '') +
+      '</div>' +
+      '<div class="act-card-title">' + title + '</div>' +
+      '<div class="act-card-direction ' + dirCls + '">' + d_ + ' ' + cents + (typeof cents === 'number' ? '¢' : '') + '</div>' +
+      '<div class="act-card-shares">' + shares + ' shares</div>' +
+      '<div class="act-card-bar"><span class="current">' + (typeof cents === 'number' ? cents + '¢' : '—') + '</span><span class="max">100¢</span></div>' +
+      '<div class="act-card-value">' +
+      '<span class="position">$' + (it.size_usdc != null ? Number(it.size_usdc).toFixed(2) : '—') + '</span>' +
+      (toWin ? '<span class="pnl pos">' + toWin + '</span>' : '') +
+      '</div></div>'
+    );
+  }
+
+  const pnlCls = (it.pnl || 0) >= 0 ? 'positive' : 'negative';
+  const pnlStr = it.pnl != null ? fmtDollar(it.pnl) : '—';
+  const pctStr = it.pnl_pct != null ? (it.pnl_pct >= 0 ? '+' : '') + it.pnl_pct.toFixed(2) + '%' : '';
+  const exitCents = it.exit_price_cents != null ? it.exit_price_cents : (it.status === 'won' ? 100 : 0);
+  const shares = it.shares != null ? it.shares.toLocaleString(undefined, { maximumFractionDigits: 1 }) : '—';
+  const positionUsd = it.position_usd != null ? Number(it.position_usd).toFixed(2) : '—';
+
+  return (
+    '<div class="act-card act-closed">' +
+    '<div class="act-card-head">' +
+    '<span class="act-card-badge ' + outcomeCls + '">' + outcomeLabel + '</span>' +
+    (ts ? '<span class="act-card-ts">' + esc(ts) + '</span>' : '') +
+    '</div>' +
+    '<div class="act-card-title">' + title + '</div>' +
+    '<div class="act-card-direction ' + dirCls + '">' + d_ + ' ' + (exitCents !== null && exitCents !== undefined ? exitCents + '¢' : '—') + '</div>' +
+    '<div class="act-card-shares">' + shares + ' shares</div>' +
+    '<div class="act-card-bar"><span class="current">' + (exitCents != null ? exitCents + '¢' : '—') + '</span><span class="max">100¢</span></div>' +
+    '<div class="act-card-value">' +
+    '<span class="position">$' + positionUsd + '</span>' +
+    '<span class="pnl ' + pnlCls + '">' + pnlStr + (pctStr ? ' (' + pctStr + ')' : '') + '</span>' +
+    '</div></div>'
+  );
+}
+
 // ── Ticker (BTC price + sentiment) ───────────────────────────────────────────
+
+/** Set the chart header price badge to the current chart symbol's price (from ticker). */
+function updateChartPriceBadge() {
+  const badge = document.getElementById('chart-price-badge');
+  if (!badge) return;
+  const sym = ChartState.getSymbol();
+  const el = document.getElementById(sym === 'btc' ? 't-btc-price' : sym === 'eth' ? 't-eth-price' : 't-sol-price');
+  if (el && el.textContent && el.textContent !== '—') {
+    badge.textContent = el.textContent;
+    badge.style.color = el.className.includes('up') ? '#22c55e' : el.className.includes('down') ? '#ef4444' : '';
+  } else {
+    badge.textContent = '—';
+    badge.style.color = '';
+  }
+}
 
 async function refreshTicker() {
   try {
@@ -508,12 +415,7 @@ async function refreshTicker() {
         cEl.textContent = `${up ? '+' : ''}${chPct.toFixed(2)}%`;
         cEl.className = `tb-val ${up ? 'up' : 'down'}`;
       }
-      // Only update badge from REST if WebSocket hasn't populated it yet
-      const badgeEl = document.getElementById('btc-badge');
-      if (badgeEl && (badgeEl.textContent === '—' || FeedManager.getStatus() !== 'LIVE')) {
-        badgeEl.textContent = `$${priceStr}`;
-        badgeEl.style.color = chPct != null ? (up ? '#22c55e' : '#ef4444') : '';
-      }
+      updateChartPriceBadge();
     }
 
     if (t.fear_greed != null) {
@@ -553,6 +455,7 @@ async function refreshCryptoPrices() {
     };
     set('t-eth-price', p.eth);
     set('t-sol-price', p.sol);
+    updateChartPriceBadge();
   } catch (_e) {}
 }
 
@@ -595,18 +498,7 @@ function applyDashboardData(d) {
   if (!items.length) {
     el.innerHTML = '<div class="empty" role="status">No orders yet. Start the bot to begin trading.</div>';
   } else {
-    el.innerHTML = items.map(it => {
-      const d_ = fmtDir(it.direction);
-      const mkt = esc(truncate(it.market || '5m', 18));
-      if (it.type === 'open') {
-        const val = it.to_win != null ? `to win $${Number(it.to_win).toFixed(2)}` : '';
-        return `<div class="act-row act-open"><span class="act-type">OPEN</span><span class="act-dir dir-${d_.toLowerCase()}">${d_}</span><span class="act-mkt">${mkt}</span><span class="act-size">$${Number(it.size_usdc || 0).toFixed(2)}</span>${val ? `<span class="act-val">${val}</span>` : ''}</div>`;
-      }
-      const won = (it.status || '').toLowerCase() === 'won';
-      const pnlCls = (it.pnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const ago = timeAgo(it.resolved_at);
-      return `<div class="act-row act-closed"><span class="act-type act-result ${won ? 'won' : 'lost'}">${won ? 'WON' : 'LOST'}</span><span class="act-dir dir-${d_.toLowerCase()}">${d_}</span><span class="act-mkt">${mkt}</span><span class="act-pnl ${pnlCls}">${fmtDollar(it.pnl)}</span>${ago ? `<span class="act-ago">${ago}</span>` : ''}</div>`;
-    }).join('');
+    el.innerHTML = items.map(it => renderActivityCard(it)).join('');
   }
 
   // Dashboard mini positions table — show: # | DIR | PRICE | TO WIN
@@ -715,18 +607,7 @@ async function refreshActivity() {
       el.innerHTML = '<div class="empty">No activity yet</div>';
       return;
     }
-    el.innerHTML = items.map(it => {
-      const d = fmtDir(it.direction);
-      const mkt = esc(truncate(it.market || '5m', 18));
-      if (it.type === 'open') {
-        const val = it.to_win != null ? `to win $${Number(it.to_win).toFixed(2)}` : '';
-        return `<div class="act-row act-open"><span class="act-type">OPEN</span><span class="act-dir dir-${d.toLowerCase()}">${d}</span><span class="act-mkt">${mkt}</span><span class="act-size">$${Number(it.size_usdc || 0).toFixed(2)}</span>${val ? `<span class="act-val">${val}</span>` : ''}</div>`;
-      }
-      const won = (it.status || '').toLowerCase() === 'won';
-      const pnlCls = (it.pnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const ago = timeAgo(it.resolved_at);
-      return `<div class="act-row act-closed"><span class="act-type act-result ${won ? 'won' : 'lost'}">${won ? 'WON' : 'LOST'}</span><span class="act-dir dir-${d.toLowerCase()}">${d}</span><span class="act-mkt">${mkt}</span><span class="act-pnl ${pnlCls}">${fmtDollar(it.pnl)}</span>${ago ? `<span class="act-ago">${ago}</span>` : ''}</div>`;
-    }).join('');
+    el.innerHTML = items.map(it => renderActivityCard(it)).join('');
   } catch (_e) {}
 }
 
@@ -787,6 +668,99 @@ async function refreshInsights() {
       if (el) el.textContent = (w.report || w.error || '—').slice(0, 2000);
     }
   } catch (_e) {}
+}
+
+async function refreshTraderPage() {
+  const container = document.getElementById('trader-cards');
+  const emptyEl = document.getElementById('trader-cards-empty');
+  const profileEl = document.getElementById('trader-profile');
+  const labelEl = document.getElementById('trader-label');
+  const strategyEl = document.getElementById('trader-strategy');
+  const wrEl = document.getElementById('trader-wr');
+  const pnlEl = document.getElementById('trader-total-pnl');
+  const nEl = document.getElementById('trader-n-trades');
+  const countEl = document.getElementById('trader-pos-count');
+  if (!container) return;
+  try {
+    const r = await apiFetch('/tracked-traders', { silent: true });
+    const traders = r.traders || [];
+    const first = traders[0];
+    if (!first || !first.positions || !first.positions.length) {
+      if (emptyEl) { emptyEl.style.display = 'block'; emptyEl.textContent = r.error || 'No tracked traders or no open positions. Add wallets in wallets_to_watch.txt'; }
+      container.innerHTML = '';
+      if (profileEl) profileEl.style.display = 'none';
+      if (countEl) countEl.textContent = '0';
+      return;
+    }
+    if (profileEl) profileEl.style.display = 'block';
+    const prof = first.profile || {};
+    if (labelEl) labelEl.textContent = prof.label || prof.address?.slice(0, 10) || '—';
+    if (strategyEl) strategyEl.textContent = prof.strategy_type || '—';
+    if (wrEl) wrEl.textContent = (prof.win_rate != null ? (prof.win_rate * 100).toFixed(1) + '%' : '—');
+    if (pnlEl) {
+      const pnl = prof.total_pnl;
+      pnlEl.textContent = (pnl != null ? (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) : '—');
+      pnlEl.className = pnl != null && pnl >= 0 ? 'pos' : pnl != null ? 'neg' : '';
+    }
+    if (nEl) nEl.textContent = String(prof.n_trades ?? 0);
+    if (countEl) countEl.textContent = String(first.positions.length);
+
+    if (emptyEl) emptyEl.style.display = 'none';
+    container.innerHTML = first.positions.map(card => {
+      const dirCls = (card.direction_short || '').toLowerCase() === 'down' ? 'down' : 'up';
+      const pnlCls = card.pnl_usd > 0 ? 'positive' : card.pnl_usd < 0 ? 'negative' : 'neutral';
+      const pnlStr = card.pnl_usd >= 0 ? '+' + card.pnl_usd.toFixed(2) : card.pnl_usd.toFixed(2);
+      const pctStr = card.pnl_pct != null ? (card.pnl_pct >= 0 ? '+' : '') + card.pnl_pct.toFixed(2) + '%' : '';
+      return (
+        '<div class="trader-card">' +
+        '<span class="tc-icon" aria-hidden="true">' + (card.market_icon === 'BTC' ? '₿' : '◆') + '</span>' +
+        '<div class="tc-title">' + esc(card.market_title || 'Unknown market') + '</div>' +
+        '<div class="tc-direction ' + dirCls + '">' + esc(card.direction_short || '') + ' ' + (card.price_cents != null ? card.price_cents + '¢' : '—') + '</div>' +
+        '<div class="tc-shares">' + (card.shares != null ? card.shares.toLocaleString(undefined, { maximumFractionDigits: 1 }) + ' shares' : '—') + '</div>' +
+        '<div class="tc-price-bar">' +
+        '<span class="current">' + (card.current_cents != null ? card.current_cents + '¢' : '—') + '</span>' +
+        '<span class="max">' + (card.max_cents != null ? card.max_cents + '¢' : '100¢') + '</span>' +
+        '</div>' +
+        '<div class="tc-value-row">' +
+        '<span class="tc-position-usd">$' + (card.position_usd != null ? card.position_usd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—') + '</span>' +
+        '<span class="tc-pnl ' + pnlCls + '">$' + pnlStr + (pctStr ? ' (' + pctStr + ')' : '') + '</span>' +
+        '</div></div>'
+      );
+    }).join('');
+  } catch (e) {
+    if (emptyEl) { emptyEl.style.display = 'block'; emptyEl.textContent = 'Failed to load: ' + (e.message || 'Unknown error'); }
+    container.innerHTML = '';
+  }
+}
+
+async function refreshStrategiesPage() {
+  const tbody = document.getElementById('strategies-body');
+  if (!tbody) return;
+  try {
+    const r = await apiFetch('/strategy-observer', { silent: true });
+    const modes = r.modes || [];
+    if (!modes.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No strategy modes (run with orchestrator for live data)</td></tr>';
+      return;
+    }
+    tbody.innerHTML = modes.map(m => {
+      const pnl = m.total_pnl != null ? m.total_pnl : 0;
+      const pnlCls = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+      const wr = (m.win_rate != null ? m.win_rate * 100 : 0).toFixed(1);
+      return (
+        '<tr>' +
+        '<td><strong>' + esc(m.label || m.id) + '</strong></td>' +
+        '<td>' + (m.min_edge != null ? m.min_edge.toFixed(3) : '—') + '</td>' +
+        '<td>' + (m.kelly != null ? m.kelly.toFixed(2) : '—') + '</td>' +
+        '<td>$' + (m.balance != null ? m.balance.toFixed(2) : '—') + '</td>' +
+        '<td class="' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '</td>' +
+        '<td>' + (m.n_trades ?? 0) + '</td>' +
+        '<td>' + wr + '%</td></tr>'
+      );
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">Error: ' + esc(e.message || 'Unknown') + '</td></tr>';
+  }
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
@@ -1057,37 +1031,6 @@ function _chartOpts(yFmt) {
   };
 }
 
-/**
- * Initialize the LightweightCharts DOM container (idempotent).
- * Must be called before FeedManager.connect() so the chart exists to receive updates.
- */
-function initBtcChartDom() {
-  if (_btcLwChart || typeof LightweightCharts === 'undefined') return;
-  const wrap = document.getElementById('btc-chart-wrap');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  _btcLwChart = LightweightCharts.createChart(wrap, {
-    layout: { background: { color: 'transparent' }, textColor: '#94a3b8' },
-    grid:   { vertLines: { color: '#1e293b' }, horzLines: { color: '#1e293b' } },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: '#334155', scaleMargins: { top: 0.1, bottom: 0.1 } },
-    timeScale: { borderColor: '#334155', timeVisible: true, secondsVisible: true },
-    handleScroll: true,
-    handleScale:  true,
-    width:  wrap.clientWidth,
-    height: wrap.clientHeight || 260,
-  });
-  const cs = _btcLwChart.addCandlestickSeries({
-    upColor:        '#22c55e', downColor:        '#ef4444',
-    borderUpColor:  '#22c55e', borderDownColor:  '#ef4444',
-    wickUpColor:    '#22c55e', wickDownColor:    '#ef4444',
-  });
-  _btcLwChart._candleSeries = cs;
-  new ResizeObserver(() => {
-    if (_btcLwChart) _btcLwChart.resize(wrap.clientWidth, wrap.clientHeight || 260);
-  }).observe(wrap);
-}
-
 async function refreshPnlChart() {
   try {
     const series = await apiFetch('/pnl-history');
@@ -1145,13 +1088,8 @@ async function refreshPnlChart() {
   } catch (e) { console.error('pnl-chart:', e); }
 }
 
-// refreshBtcChart: called from refreshAll but is a no-op once FeedManager is running.
-// Only runs on the first call to seed the chart before WS connects.
-async function refreshBtcChart() {
-  if (_feedInitialized) { initBtcChartDom(); return; }
-  // This path is taken only if somehow called before _feedInitialized is set.
-  // FeedManager.connect() handles seeding + live updates.
-}
+// refreshBtcChart: no-op (chart is TradingView only)
+async function refreshBtcChart() {}
 
 // ── Controls ──────────────────────────────────────────────────────────────────
 
@@ -1202,6 +1140,31 @@ document.getElementById('btn-find-markets').addEventListener('click', async () =
   finally { btn.disabled = false; btn.textContent = 'FIND MARKETS'; }
 });
 
+const btnRetrain = document.getElementById('btn-retrain');
+if (btnRetrain) {
+  btnRetrain.addEventListener('click', async () => {
+    btnRetrain.disabled = true;
+    btnRetrain.textContent = 'Retraining…';
+    try {
+      const r = await fetch(_apiBase + '/api/retrain', { method: 'POST' });
+      const j = await r.json();
+      if (j.ok) {
+        btnRetrain.textContent = '✓ Retrained';
+        const el = document.getElementById('insight-learn');
+        if (el) el.textContent = (el.textContent || '') + '\n\n[Model retrained. Brier: ' + (j.train_brier?.toFixed(4) ?? '—') + ']';
+        refreshInsights();
+      } else {
+        btnRetrain.textContent = 'Retrain failed';
+        alert(j.error || 'Retrain failed');
+      }
+    } catch (e) {
+      btnRetrain.textContent = 'Retrain failed';
+      alert(e.message || 'Request failed');
+    }
+    setTimeout(() => { btnRetrain.disabled = false; btnRetrain.textContent = '🔄 Retrain Model'; }, 3000);
+  });
+}
+
 document.getElementById('btn-live-check').addEventListener('click', async () => {
   try {
     const d = await apiFetch('/live-check');
@@ -1223,6 +1186,8 @@ function showPage(view) {
   document.querySelectorAll('.page').forEach(p => {
     p.classList.toggle('active', p.id === 'page-' + view);
   });
+  if (view === 'trader') refreshTraderPage();
+  if (view === 'strategies') refreshStrategiesPage();
 }
 
 document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -1250,6 +1215,14 @@ async function refreshDashboard() {
     refreshControls(d?.status, null);
   } catch (e) {
     console.warn('Dashboard fetch failed:', e.message);
+    _showDataLoadError(e.message);
+  }
+}
+
+function _showDataLoadError(msg) {
+  const el = document.getElementById('activity-feed');
+  if (el) {
+    el.innerHTML = '<div class="empty" role="alert">Unable to load data. Ensure the server is running: <code>python web/run.py</code></div>';
   }
 }
 
@@ -1266,42 +1239,274 @@ async function refreshAll() {
     refreshParams(),
     refreshPnlChart(),
     // BTC chart: FeedManager handles live updates via WebSocket
-    // refreshBtcChart() intentionally omitted once feed is initialized
+    // Chart is TradingView only; refreshBtcChart is a no-op
   ]);
   refreshGrid();
   refreshPerformance();
   refreshFooterSentiment();
   refreshInsights();
+  if (_currentView === 'trader') refreshTraderPage();
+  if (_currentView === 'strategies') refreshStrategiesPage();
   try {
     const ms = await apiFetch('/markets-summary', { silent: true });
     refreshControls(d?.status, ms);
   } catch (_e) { refreshControls(d?.status, null); }
 }
 
-// ── Symbol switcher ───────────────────────────────────────────────────────────
+// ── Symbol & Timeframe (TradingView only) ──────────────────────────────────────
+
+const TradingViewWidget = (() => {
+  let _container = null;
+  const SYMBOL_MAP = { btc: 'BINANCE:BTCUSDT', eth: 'BINANCE:ETHUSDT', sol: 'BINANCE:SOLUSDT' };
+  const INTERVAL_MAP = { '1m': '1', '5m': '5', '15m': '15', '1h': '60' };
+
+  function load(symbolKey, timeframeKey) {
+    const symbol = SYMBOL_MAP[symbolKey] || SYMBOL_MAP.btc;
+    const interval = INTERVAL_MAP[timeframeKey] || '1';
+    _container = document.getElementById('tradingview-chart-wrap');
+    if (!_container) return;
+    _container.innerHTML = '';
+    const div = document.createElement('div');
+    div.className = 'tradingview-widget-container';
+    div.style.cssText = 'height:100%;width:100%;min-height:200px;';
+    div.innerHTML = '<div class="tradingview-widget-container__widget" style="height:calc(100% - 32px);width:100%"></div>';
+    const script = document.createElement('script');
+    script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+    script.type = 'text/javascript';
+    script.async = true;
+    script.textContent = JSON.stringify({
+      autosize: true,
+      symbol: symbol,
+      interval: interval,
+      timezone: 'Etc/UTC',
+      theme: 'dark',
+      style: '1',
+      locale: 'en',
+      backgroundColor: 'rgba(7, 11, 17, 1)',
+      hide_top_toolbar: false,
+      save_image: true,
+      calendar: false,
+      support_host: 'https://www.tradingview.com',
+    });
+    div.appendChild(script);
+    _container.appendChild(div);
+  }
+
+  return { load };
+})();
 
 document.querySelectorAll('.sym-btn').forEach(btn => {
-  btn.addEventListener('click', () => FeedManager.switchSymbol(btn.dataset.sym));
+  btn.addEventListener('click', () => {
+    ChartState.switchSymbol(btn.dataset.sym);
+    showPage('dashboard');
+  });
+});
+
+document.querySelectorAll('.tf-btn').forEach(btn => {
+  btn.addEventListener('click', () => ChartState.switchTimeframe(btn.dataset.tf));
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
-// 1. Initialize chart DOM (must be before FeedManager.connect so chart exists)
-initBtcChartDom();
+// ── Init ──────────────────────────────────────────────────────────────────────
 
-// 2. Start live WebSocket feed (seeds from REST + opens WS)
-FeedManager.connect('btc');
-_feedInitialized = true;
+TradingViewWidget.load('btc', '1m');
+updateChartPriceBadge();
 
-// 3. Initial data fetch + start polling
 refreshAll();
-setInterval(refreshAll,          8000);  // Full refresh every 8s
-setInterval(refreshDashboard,    2000);  // Positions + activity every 2s (near real-time)
-setInterval(refreshTicker,       5000);  // Price ticker every 5s
-setInterval(refreshCryptoPrices, 15000); // ETH/SOL less frequently
+setInterval(refreshAll,          8000);
+setInterval(refreshDashboard,    2000);
+setInterval(refreshTicker,       5000);
+setInterval(refreshCryptoPrices, 15000);
 
 let _rTimer;
 window.addEventListener('resize', () => {
   clearTimeout(_rTimer);
   _rTimer = setTimeout(() => { if (_pnlChart) refreshPnlChart(); }, 200);
 });
+
+// ── Column resize splitter ────────────────────────────────────────────────────
+(function initDashSplitter() {
+  const splitter = document.getElementById('dash-splitter');
+  const colLeft = document.getElementById('dash-charts-col');
+  const colRight = document.getElementById('dash-orders-col');
+  const grid = document.querySelector('.dash-grid');
+  if (!splitter || !colLeft || !colRight || !grid) return;
+
+  let startX = 0, startLeft = 0, startRight = 0;
+
+  splitter.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    splitter.classList.add('dragging');
+    document.body.classList.add('panel-resize-horizontal');
+    startX = e.clientX;
+    startLeft = colLeft.offsetWidth;
+    startRight = colRight.offsetWidth;
+    const onMove = (move) => {
+      move.preventDefault();
+      const dx = move.clientX - startX;
+      const w = grid.offsetWidth;
+      const left = Math.max(200, Math.min(w - 220, startLeft + dx));
+      const right = w - left - (splitter.offsetWidth || 6);
+      colLeft.style.flex = `1 1 ${left}px`;
+      colLeft.style.maxWidth = 'none';
+      colRight.style.flex = `1 1 ${right}px`;
+      colRight.style.maxWidth = 'none';
+    };
+    const onUp = () => {
+      splitter.classList.remove('dragging');
+      document.body.classList.remove('panel-resize-horizontal');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      try {
+        const leftBasis = parseInt(colLeft.style.flex?.replace(/.*\s(\d+)px/, '$1') || '0', 10);
+        const rightBasis = colRight.offsetWidth;
+        if (leftBasis >= 200 && rightBasis >= 220)
+          localStorage.setItem('polyquant_dash_columns', JSON.stringify({ left: leftBasis, right: rightBasis }));
+      } catch (_) {}
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  // Restore column widths
+  try {
+    const saved = JSON.parse(localStorage.getItem('polyquant_dash_columns') || 'null');
+    if (saved && typeof saved.left === 'number' && saved.left >= 200 && saved.right >= 220) {
+      colLeft.style.flex = `1 1 ${saved.left}px`;
+      colLeft.style.maxWidth = 'none';
+      colRight.style.flex = `1 1 ${saved.right}px`;
+      colRight.style.maxWidth = 'none';
+    }
+  } catch (_) {}
+})();
+
+// ── Panel height resize (per-panel drag handle) ─────────────────────────────────
+(function initPanelResize() {
+  const STORAGE_KEY = 'polyquant_panel_';
+
+  function applyPanelHeight(panel, heightPx) {
+    if (!panel || heightPx == null) return;
+    const min = parseInt(panel.getAttribute('data-resize-min'), 10) || 100;
+    const max = parseInt(panel.getAttribute('data-resize-max'), 10) || 800;
+    const px = Math.max(min, Math.min(max, heightPx));
+    panel.style.height = px + 'px';
+    panel.style.flex = '0 0 auto';
+    panel.style.minHeight = px + 'px';
+  }
+
+  function persistPanelHeight(id, heightPx) {
+    try { localStorage.setItem(STORAGE_KEY + id, String(heightPx)); } catch (_) {}
+  }
+
+  function loadPanelHeights() {
+    document.querySelectorAll('.panel-resize-handle[data-resize]').forEach(handle => {
+      const id = handle.getAttribute('data-resize');
+      const panel = document.getElementById(id);
+      if (!panel) return;
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY + id);
+        if (saved != null) applyPanelHeight(panel, parseInt(saved, 10));
+      } catch (_) {}
+    });
+  }
+
+  document.querySelectorAll('.panel-resize-handle[data-resize]').forEach(handle => {
+    const id = handle.getAttribute('data-resize');
+    const panel = document.getElementById(id);
+    if (!panel) return;
+
+      handle.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      handle.classList.add('dragging');
+      document.body.classList.add('panel-resize-vertical');
+      const startY = e.clientY;
+      const startHeight = panel.offsetHeight;
+      const min = parseInt(panel.getAttribute('data-resize-min'), 10) || 100;
+      const max = parseInt(panel.getAttribute('data-resize-max'), 10) || 800;
+
+      const onMove = (move) => {
+        move.preventDefault();
+        const dy = move.clientY - startY;
+        const h = Math.max(min, Math.min(max, startHeight + dy));
+        panel.style.height = h + 'px';
+        panel.style.flex = '0 0 auto';
+        panel.style.minHeight = h + 'px';
+      };
+      const onUp = () => {
+        handle.classList.remove('dragging');
+        document.body.classList.remove('panel-resize-vertical');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        persistPanelHeight(id, panel.offsetHeight);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+
+    // Double-click: reset to default (clear saved height)
+    handle.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      try { localStorage.removeItem(STORAGE_KEY + id); } catch (_) {}
+      panel.style.height = '';
+      panel.style.flex = '';
+      panel.style.minHeight = '';
+    });
+  });
+
+  loadPanelHeights();
+})();
+
+// ── Row splitter (equity | perf) ──────────────────────────────────────────────
+(function initRowSplitter() {
+  const splitter = document.getElementById('splitter-equity-perf');
+  const row = document.getElementById('row-equity-perf');
+  const panelEquity = document.getElementById('panel-equity');
+  const panelPerf = document.getElementById('panel-perf');
+  const STORAGE_KEY = 'polyquant_row_equity_perf';
+  const MIN_LEFT = 140, MIN_RIGHT = 120;
+
+  if (!splitter || !row || !panelEquity || !panelPerf) return;
+
+  splitter.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    splitter.classList.add('dragging');
+    document.body.classList.add('panel-resize-horizontal');
+    const startX = e.clientX;
+    const startLeft = panelEquity.offsetWidth;
+
+    const onMove = (move) => {
+      move.preventDefault();
+      const dx = move.clientX - startX;
+      const total = row.offsetWidth - splitter.offsetWidth;
+      let left = Math.max(MIN_LEFT, Math.min(total - MIN_RIGHT, startLeft + dx));
+      panelEquity.style.flex = `0 0 ${left}px`;
+      panelEquity.style.minWidth = left + 'px';
+      panelPerf.style.flex = '1 1 0';
+      panelPerf.style.minWidth = MIN_RIGHT + 'px';
+    };
+    const onUp = () => {
+      splitter.classList.remove('dragging');
+      document.body.classList.remove('panel-resize-horizontal');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      try { localStorage.setItem(STORAGE_KEY, String(panelEquity.offsetWidth)); } catch (_) {}
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved != null) {
+      const left = Math.max(MIN_LEFT, parseInt(saved, 10));
+      panelEquity.style.flex = `0 0 ${left}px`;
+      panelEquity.style.minWidth = left + 'px';
+      panelPerf.style.flex = '1 1 0';
+      panelPerf.style.minWidth = MIN_RIGHT + 'px';
+    }
+  } catch (_) {}
+})();

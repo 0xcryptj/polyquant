@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from paper_trading.blotter import TradeBlotter
     from wallets.providers.base import WalletProvider
     from execution.providers.base import ExecutionProvider
+    from observers.strategy_observer import StrategyObserver
 
 BOT_VERSION = "2.0.0"
 
@@ -56,6 +57,9 @@ class RuntimeContext:
 
     # ── State store (persists enabled, mode, last_tick, etc.) ─────────────────
     state_store: "Any | None" = None
+
+    # ── Strategy observer (shadow tracks per min_edge/kelly mode) ──────────────
+    strategy_observer: "StrategyObserver | None" = None
 
     # ── Data caches (written by DataService, read by Telegram + Web) ──────────
     sentiment_cache:      "dict | None" = None

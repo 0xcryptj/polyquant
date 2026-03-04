@@ -700,6 +700,10 @@ class PaperEngine:
         prob = 1.0 / (1.0 + np.exp(-50.0 * mom))
         return float(np.clip(prob, 0.35, 0.65))
 
+    def invalidate_model_cache(self) -> None:
+        """Clear cached calibration model so next inference loads the latest from disk."""
+        self._pipeline = None
+
     def _get_llm_prob(
         self,
         token_id: str,
@@ -803,8 +807,8 @@ class PaperEngine:
         sim_bid = sim_ask - 0.02   # 2-cent spread
 
         min_edge = db.get_param("min_edge", settings.min_edge_threshold)
-        # In SIM, accept slightly negative EV to ensure constant 5m order flow for learning
-        min_edge_sim = min(min_edge, -0.02)
+        # In SIM, optionally accept slightly negative EV to ensure 5m order flow for learning
+        min_edge_sim = min(min_edge, -0.02) if settings.sim_allow_negative_edge else min_edge
         max_spread = db.get_param("max_spread", settings.max_spread)
 
         from models.ev_filter import evaluate_trade

@@ -186,6 +186,29 @@ def _polymarket_url(token_id: str, meta: dict | None = None) -> str:
     return f"https://polymarket.com/?tid={token_id}" if token_id else "https://polymarket.com"
 
 
+def _format_activity_market_title(question: str, end_date_iso: str) -> str:
+    """Build display title like 'Bitcoin Up or Down - March 3, 10:20PM-10:25PM ET'."""
+    if not question and not end_date_iso:
+        return "Unknown market"
+    try:
+        if end_date_iso:
+            from dateutil import parser as dateutil_parser
+            dt = dateutil_parser.parse(end_date_iso)
+            if dt.tzinfo:
+                try:
+                    from zoneinfo import ZoneInfo
+                    dt = dt.astimezone(ZoneInfo("America/New_York"))
+                except Exception:
+                    pass
+            date_str = dt.strftime("%b %d, %I:%M%p").lstrip("0").replace("  ", " ")
+            if "ET" not in date_str and "UTC" not in date_str:
+                date_str += " ET"
+            return f"{question.strip()} - {date_str}" if (question or "").strip() else date_str
+    except Exception:
+        pass
+    return (question or "").strip() or "Unknown market"
+
+
 def _display_label_for_trade(r: dict, meta: dict) -> tuple[str, str]:
     """
     Return (question_display, market_type) for positions/trades.
@@ -369,36 +392,61 @@ async def api_activity(limit: int = 30):
     for r in opens:
         meta = _get_market_meta(r["token_id"])
         q_display, _ = _display_label_for_trade(r, meta)
+        question = (meta.get("question") or meta.get("event_title") or "").strip() or q_display
+        end_date_iso = meta.get("end_date_iso") or meta.get("end_date") or meta.get("endDate") or ""
+        market_title = _format_activity_market_title(question, end_date_iso)
         shares = _shares_from_row(r)
         entry = float(r.get("entry_price") or 0)
         direction = (r.get("direction") or "YES").upper()
         to_win = round(_to_win(shares, entry, direction), 2)
+        size_usdc = float(r.get("size_usdc") or 0)
         items.append({
             "type": "open",
             "id": r.get("id"),
             "direction": r.get("direction", "YES"),
             "market": q_display,
-            "size_usdc": float(r.get("size_usdc") or 0),
+            "market_title": market_title,
+            "size_usdc": size_usdc,
             "to_win": to_win,
             "opened_at": r.get("opened_at"),
             "btc_entry": r.get("btc_price_entry"),
+            "entry_price": entry,
+            "entry_price_cents": round(entry * 100, 1),
+            "shares": round(shares, 1),
         })
     for r in closed:
         meta = _get_market_meta(r["token_id"])
         q_display, _ = _display_label_for_trade(r, meta)
+        question = (meta.get("question") or meta.get("event_title") or "").strip() or q_display
+        end_date_iso = meta.get("end_date_iso") or meta.get("end_date") or meta.get("endDate") or ""
+        market_title = _format_activity_market_title(question, end_date_iso)
         pnl = r.get("pnl") or 0
         status = (r.get("status") or "lost").lower()
         if status == "lost" and pnl >= 0:
             pnl = -abs(float(r.get("size_usdc") or 0))
+        size_usdc = float(r.get("size_usdc") or 0)
+        position_usd = round(size_usdc + pnl, 2)
+        pnl_pct = round((pnl / size_usdc * 100), 2) if size_usdc else 0
+        exit_price = float(r.get("exit_price") or 0)
+        exit_cents = round(exit_price * 100, 1) if exit_price else (100 if status == "won" else 0)
         items.append({
             "type": "closed",
             "id": r.get("id"),
             "direction": r.get("direction", "YES"),
             "market": q_display,
-            "size_usdc": float(r.get("size_usdc") or 0),
+            "market_title": market_title,
+            "size_usdc": size_usdc,
             "pnl": pnl,
             "status": status,
             "resolved_at": r.get("resolved_at"),
+            "opened_at": r.get("opened_at"),
+            "cost_usd": round(size_usdc, 2),
+            "position_usd": position_usd,
+            "pnl_pct": pnl_pct,
+            "entry_price": float(r.get("entry_price") or 0),
+            "entry_price_cents": round(float(r.get("entry_price") or 0) * 100, 1),
+            "exit_price_cents": exit_cents,
+            "shares": round(_shares_from_row(r), 1),
         })
     # Sort: opens first (by opened_at desc), then closed (by resolved_at desc)
     def _ts(it):
@@ -438,6 +486,9 @@ async def api_dashboard():
     status.setdefault("paper_trading", settings.paper_trading)
     if _ctx is not None:
         status["trading_paused"] = not _ctx.trading_active.is_set()
+        if _ctx.engine is not None:
+            status["kill_switch"] = _ctx.engine.kill_switch.is_triggered()
+            status["kill_switch_reason"] = _ctx.engine.kill_switch.reason or ""
     else:
         ov = _read_mode_override()
         status["trading_paused"] = ov.get("trading_paused", False)
@@ -453,26 +504,44 @@ async def api_dashboard():
     for r in opens:
         meta = _get_market_meta(r.get("token_id") or "", markets)
         q_display, _ = _display_label_for_trade(r, meta)
+        question = (meta.get("question") or meta.get("event_title") or "").strip() or q_display
+        end_date_iso = meta.get("end_date_iso") or meta.get("end_date") or meta.get("endDate") or ""
+        market_title = _format_activity_market_title(question, end_date_iso)
         shares = _shares_from_row(r)
         entry = float(r.get("entry_price") or 0)
         direction = (r.get("direction") or "YES").upper()
         to_win = round(_to_win(shares, entry, direction), 2)
         activity.append({
             "type": "open", "id": r.get("id"), "direction": r.get("direction", "YES"),
-            "market": q_display, "size_usdc": float(r.get("size_usdc") or 0),
-            "to_win": to_win, "opened_at": r.get("opened_at"), "btc_entry": r.get("btc_price_entry"),
+            "market": q_display, "market_title": market_title,
+            "size_usdc": float(r.get("size_usdc") or 0), "to_win": to_win,
+            "opened_at": r.get("opened_at"), "btc_entry": r.get("btc_price_entry"),
+            "entry_price": entry, "entry_price_cents": round(entry * 100, 1), "shares": round(shares, 1),
         })
     for r in closed:
         meta = _get_market_meta(r.get("token_id") or "", markets)
         q_display, _ = _display_label_for_trade(r, meta)
+        question = (meta.get("question") or meta.get("event_title") or "").strip() or q_display
+        end_date_iso = meta.get("end_date_iso") or meta.get("end_date") or meta.get("endDate") or ""
+        market_title = _format_activity_market_title(question, end_date_iso)
         pnl = r.get("pnl") or 0
         status_val = (r.get("status") or "lost").lower()
         if status_val == "lost" and pnl >= 0:
             pnl = -abs(float(r.get("size_usdc") or 0))
+        size_usdc = float(r.get("size_usdc") or 0)
+        position_usd = round(size_usdc + pnl, 2)
+        pnl_pct = round((pnl / size_usdc * 100), 2) if size_usdc else 0
+        exit_price = float(r.get("exit_price") or 0)
+        exit_cents = round(exit_price * 100, 1) if exit_price else (100 if status_val == "won" else 0)
         activity.append({
             "type": "closed", "id": r.get("id"), "direction": r.get("direction", "YES"),
-            "market": q_display, "size_usdc": float(r.get("size_usdc") or 0),
-            "pnl": pnl, "status": status_val, "resolved_at": r.get("resolved_at"),
+            "market": q_display, "market_title": market_title,
+            "size_usdc": size_usdc, "pnl": pnl, "status": status_val,
+            "resolved_at": r.get("resolved_at"), "opened_at": r.get("opened_at"),
+            "cost_usd": round(size_usdc, 2), "position_usd": position_usd, "pnl_pct": pnl_pct,
+            "entry_price": float(r.get("entry_price") or 0),
+            "entry_price_cents": round(float(r.get("entry_price") or 0) * 100, 1),
+            "exit_price_cents": exit_cents, "shares": round(_shares_from_row(r), 1),
         })
     activity.sort(key=lambda x: x.get("opened_at") or x.get("resolved_at") or "", reverse=True)
 
@@ -504,7 +573,24 @@ async def api_dashboard():
             "polymarket_url": _polymarket_url(r.get("token_id") or "", meta),
         })
 
-    return {"status": status, "activity": activity, "positions": positions, "trades": trades}
+    # Strategy observer (shadow modes) — for dashboard and strategies page
+    if _ctx is not None and getattr(_ctx, "strategy_observer", None) is not None:
+        strategy_modes = _ctx.strategy_observer.get_leaderboard()
+    else:
+        from observers.strategy_observer import STRATEGY_MODES
+        strategy_modes = [
+            {"id": m["id"], "label": m["label"], "min_edge": m["min_edge"], "kelly": m["kelly"],
+             "balance": 1000.0, "starting_balance": 1000.0, "total_pnl": 0.0, "n_trades": 0, "win_rate": 0.0}
+            for m in STRATEGY_MODES
+        ]
+
+    return {
+        "status": status,
+        "activity": activity,
+        "positions": positions,
+        "trades": trades,
+        "strategy_modes": strategy_modes,
+    }
 
 
 @app.get("/api/trades")
@@ -558,18 +644,20 @@ async def api_pnl_history():
 
     if has_balance_after:
         series = [{"trade": 0, "timestamp": None, "cumulative": starting, "pnl": 0}]
-        for i, t in enumerate(closed):
+        trade_num = 0
+        for t in closed:
             ba = t.get("balance_after")
             if ba is None:
                 continue
+            trade_num += 1
             series.append({
-                "trade": i + 1,
+                "trade": trade_num,
                 "timestamp": t.get("resolved_at"),
                 "cumulative": float(ba),
                 "pnl": t.get("pnl") or 0,
             })
         # Ensure last point reflects current equity (including open positions)
-        series.append({"trade": len(closed) + 1, "timestamp": None, "cumulative": current_equity, "pnl": 0})
+        series.append({"trade": trade_num + 1, "timestamp": None, "cumulative": current_equity, "pnl": 0})
         return series
 
     # Fallback: normalize the cumulative PnL series to actual equity range
@@ -660,8 +748,11 @@ async def api_pause():
 
 @app.post("/api/resume")
 async def api_resume():
-    """Resume trading loop."""
+    """Resume trading loop. If kill switch was triggered, resets it using current balance (daily baseline = now) then enables trading."""
     if _ctx is not None:
+        engine = getattr(_ctx, "engine", None)
+        if engine is not None and getattr(engine, "kill_switch", None) is not None and engine.kill_switch.is_triggered():
+            engine.kill_switch.reset(engine.balance)
         _ctx.trading_active.set()
     else:
         _write_mode_override({"trading_paused": False})
@@ -757,8 +848,8 @@ async def api_trade_grid():
 
 
 @app.get("/api/btc-chart")
-async def api_btc_chart(limit: int = 120, symbol: str = "BTC/USDT"):
-    """Live chart: Coinbase Exchange → ccxt (Binance/Kraken) → CoinGecko. Multi-symbol."""
+async def api_btc_chart(limit: int = 120, symbol: str = "BTC/USDT", timeframe: str = "1m"):
+    """Live chart: Coinbase Exchange → ccxt (Binance/Kraken) → CoinGecko. Multi-symbol, multi-timeframe."""
     try:
         n = max(1, min(int(limit), 500))
     except (TypeError, ValueError):
@@ -766,12 +857,18 @@ async def api_btc_chart(limit: int = 120, symbol: str = "BTC/USDT"):
 
     # Normalize symbol: "BTC/USDT", "ETH/USDT", "SOL/USDT" etc.
     sym = (symbol or "BTC/USDT").strip().upper()
-    # Accept bare symbols like "BTCUSDT" → "BTC/USDT"
     if "/" not in sym and len(sym) >= 6:
         sym = sym[:3] + "/" + sym[3:]
     is_btc = sym in ("BTC/USDT", "BTC/USD")
 
-    # Map ccxt symbol → Coinbase product ID
+    # Timeframe: 1m, 5m, 15m, 1h → ccxt / Coinbase granularity
+    tf = (timeframe or "1m").strip().lower()
+    if tf not in ("1m", "5m", "15m", "1h"):
+        tf = "1m"
+    # Coinbase granularity in seconds: 60=1m, 300=5m, 900=15m, 3600=1h
+    granularity_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+    granularity = granularity_map.get(tf, 60)
+
     coinbase_map = {"BTC/USDT": "BTC-USD", "BTC/USD": "BTC-USD",
                     "ETH/USDT": "ETH-USD", "ETH/USD": "ETH-USD",
                     "SOL/USDT": "SOL-USD", "SOL/USD": "SOL-USD"}
@@ -783,27 +880,24 @@ async def api_btc_chart(limit: int = 120, symbol: str = "BTC/USDT"):
             for ts, row in df.tail(n).iterrows()
         ]
 
-    # 1) Coinbase Exchange (public, no geo-block, BTC/ETH/SOL)
     cb_product = coinbase_map.get(sym)
     if cb_product:
         try:
             from data.collector_coinbase import fetch_ohlcv as coinbase_fetch
-            df = coinbase_fetch(product_id=cb_product, granularity=60, limit=n)
+            df = coinbase_fetch(product_id=cb_product, granularity=granularity, limit=n)
             if df is not None and not df.empty:
                 return _to_candles(df)
         except Exception:
             pass
 
-    # 2) ccxt: Binance or Kraken (any symbol)
     try:
         from data.collector_binance import fetch_ohlcv
-        df = fetch_ohlcv(symbol=sym, timeframe="1m", limit=n)
+        df = fetch_ohlcv(symbol=sym, timeframe=tf, limit=n)
         if df is not None and not df.empty:
             return _to_candles(df)
     except Exception:
         pass
 
-    # 3) CoinGecko fallback (BTC only, optional API key from settings)
     if is_btc:
         try:
             from config.settings import settings
@@ -931,11 +1025,41 @@ async def api_sentiment():
 async def api_learn():
     """Adaptive learning report (same as Telegram /learn)."""
     try:
-        from paper_trading.learner import Learner
-        learner = Learner()
+        learner = getattr(_ctx, "learner", None)
+        if learner is None:
+            from paper_trading.learner import Learner
+            learner = Learner()
         return {"report": learner.build_report()}
     except Exception as e:
         return {"report": "", "error": str(e)}
+
+
+@app.post("/api/retrain")
+async def api_retrain():
+    """Force retrain calibration model on closed trades. Requires 50+ trades with features."""
+    try:
+        from learning.retrain import maybe_retrain
+        metrics = maybe_retrain(
+            min_trades=50,
+            min_brier_to_trigger=0.0,  # force retrain regardless of Brier
+            current_brier=None,
+            n_closed=None,
+        )
+        if metrics is None:
+            return {"ok": False, "error": "Not enough data (need 50+ closed trades with features)"}
+        # Invalidate engine cache so next cycle uses new model
+        if _ctx is not None:
+            engine = getattr(_ctx, "engine", None)
+            if engine is not None and hasattr(engine, "invalidate_model_cache"):
+                engine.invalidate_model_cache()
+        return {
+            "ok": True,
+            "train_brier": metrics.get("train_brier"),
+            "val_brier": metrics.get("val_brier"),
+            "n_train": metrics.get("n_train"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/wallets")
@@ -947,6 +1071,60 @@ async def api_wallets():
         return {"report": tracker.build_report()}
     except Exception as e:
         return {"report": f"Wallet report unavailable: {e}", "error": str(e)}
+
+
+@app.get("/api/tracked-traders")
+async def api_tracked_traders():
+    try:
+        from data.wallet_tracker import WalletTracker, position_to_card
+        tracker = WalletTracker()
+        stats_list = tracker.analyse_all(force=False)
+        out = []
+        for s in stats_list:
+            cards = [position_to_card(p) for p in s.current_positions]
+            out.append({
+                "profile": {
+                    "address": s.wallet,
+                    "label": s.label,
+                    "strategy_type": s.strategy_type,
+                    "win_rate": s.win_rate,
+                    "total_pnl": s.total_pnl,
+                    "n_trades": s.n_trades,
+                    "avg_trade_size": s.avg_trade_size,
+                    "is_stale": s.is_stale,
+                },
+                "positions": cards,
+            })
+        return {"traders": out}
+    except Exception as e:
+        return {"traders": [], "error": str(e)}
+
+
+@app.get("/api/strategy-observer")
+async def api_strategy_observer():
+    """Strategy observer: virtual PnL per mode (conservative / default / aggressive)."""
+    try:
+        if _ctx is not None and getattr(_ctx, "strategy_observer", None) is not None:
+            modes = _ctx.strategy_observer.get_leaderboard()
+        else:
+            from observers.strategy_observer import STRATEGY_MODES
+            modes = [
+                {
+                    "id": m["id"],
+                    "label": m["label"],
+                    "min_edge": m["min_edge"],
+                    "kelly": m["kelly"],
+                    "balance": 1000.0,
+                    "starting_balance": 1000.0,
+                    "total_pnl": 0.0,
+                    "n_trades": 0,
+                    "win_rate": 0.0,
+                }
+                for m in STRATEGY_MODES
+            ]
+        return {"modes": modes}
+    except Exception as e:
+        return {"modes": [], "error": str(e)}
 
 
 @app.get("/api/live-check")

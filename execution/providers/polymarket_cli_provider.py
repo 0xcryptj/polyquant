@@ -81,7 +81,10 @@ def get_orderbook(market_id: str) -> dict[str, Any] | None:
         return None
     bid = float(data.get("bid", data.get("bestBid", 0)) or 0)
     ask = float(data.get("ask", data.get("bestAsk", 0)) or 0)
-    mid = float(data.get("mid", data.get("midPrice", 0)) or ((bid + ask) / 2 if ask > 0 else 0))
+    mid_raw = data.get("mid")
+    if mid_raw is None:
+        mid_raw = data.get("midPrice")
+    mid = float(mid_raw) if mid_raw is not None else ((bid + ask) / 2 if ask > 0 else 0.0)
     return {
         "token_id": market_id,
         "bid": bid,

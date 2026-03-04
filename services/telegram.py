@@ -281,7 +281,7 @@ class TelegramService(BaseService):
         action = query.data[3:].strip()
         admin = self._is_admin(update)
         # Write actions require admin
-        if action in ("start_paper", "pause", "kill_switch", "wallet_ui") and not admin:
+        if action in ("start_paper", "pause", "kill_switch", "kill_confirm", "wallet_ui") and not admin:
             await query.edit_message_text("🔒 Admin only.")
             return
         handlers = {

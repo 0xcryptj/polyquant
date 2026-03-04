@@ -108,6 +108,12 @@ def init_db() -> None:
         "UPDATE balance SET starting_usdc = 1000.0 WHERE starting_usdc IS NULL OR starting_usdc = 0"
     )
     conn.commit()
+    # Migration: add balance_after to trades (tracks equity at each resolution)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN balance_after REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
 
 # ── Balance ───────────────────────────────────────────────────────────────────
@@ -265,9 +271,10 @@ def resolve_trade_and_set_balance(
                    btc_price_exit = ?,
                    exit_price = ?,
                    pnl = ?,
-                   status = ?
+                   status = ?,
+                   balance_after = ?
                WHERE id = ?""",
-            (now, btc_price_exit, exit_price, pnl, status, trade_id),
+            (now, btc_price_exit, exit_price, pnl, status, new_balance, trade_id),
         )
         conn.execute(
             "INSERT INTO balance (id, usdc, starting_usdc, updated_at) VALUES (1, ?, ?, ?) "

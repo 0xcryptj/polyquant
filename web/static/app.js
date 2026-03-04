@@ -1,6 +1,11 @@
 /**
  * PolyQuant Terminal — Bloomberg-style live dashboard
- * Refreshes every 10 s; individual fetch errors are silently logged.
+ *
+ * Modules:
+ *   CandleBuilder  — pure 1-second OHLCV aggregator (unit-testable, no DOM)
+ *   FeedManager    — Binance WebSocket with auto-reconnect + status badge
+ *   CommandPalette — overlay palette (/ to open, ↑↓ navigate, ↵ run)
+ *   KeyboardShortcuts — global bindings (1/2/3 symbols, D/P/T/F/I/C pages)
  */
 
 // ── XSS helpers ──────────────────────────────────────────────────────────────
@@ -70,6 +75,18 @@ function timeAgo(iso) {
   return `${Math.floor(s / 86400)}d`;
 }
 
+function fmtTs(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const dy = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${mo}/${dy} ${hh}:${mm}:${ss}`;
+}
+
 // ── API fetch ─────────────────────────────────────────────────────────────────
 
 async function apiFetch(path, { silent = false } = {}) {
@@ -80,6 +97,215 @@ async function apiFetch(path, { silent = false } = {}) {
   }
   return r.json();
 }
+
+// ── Chart & Feed state (declared early so FeedManager can reference them) ─────
+
+let _pnlChart        = null;  // Chart.js equity curve
+let _btcLwChart      = null;  // TradingView Lightweight Charts (OHLCV)
+let _btcChart        = null;  // Chart.js BTC fallback
+let _feedInitialized = false; // true once FeedManager.connect() called
+
+// ── CandleBuilder — pure 1-second OHLCV aggregator ────────────────────────────
+/**
+ * @typedef {{ time: number, open: number, high: number, low: number, close: number, volume: number }} OHLCCandle
+ */
+const CandleBuilder = (() => {
+  /** @type {Map<number, OHLCCandle>} */
+  const _store = new Map();
+
+  /**
+   * Process a raw Binance trade tick into a 1-second OHLCV candle.
+   * @param {{ T: number, p: string, q: string }} tick  Binance trade message
+   * @returns {{ candle: OHLCCandle, isNew: boolean }}
+   */
+  function processTick(tick) {
+    const price = parseFloat(tick.p);
+    const qty   = parseFloat(tick.q);
+    const key   = Math.floor(tick.T / 1000); // 1-second bucket = LightweightCharts unix time
+    const isNew = !_store.has(key);
+    if (isNew) {
+      _store.set(key, { time: key, open: price, high: price, low: price, close: price, volume: qty });
+    } else {
+      const c = _store.get(key);
+      if (price > c.high) c.high = price;
+      if (price < c.low)  c.low  = price;
+      c.close   = price;
+      c.volume += qty;
+    }
+    return { candle: _store.get(key), isNew };
+  }
+
+  /**
+   * Seed with historical REST candles: [{t: ms, o, h, l, c}, ...]
+   * @param {Array<{t:number,o:number,h:number,l:number,c:number}>} restCandles
+   */
+  function seed(restCandles) {
+    _store.clear();
+    restCandles.forEach(c => {
+      const key = Math.floor(c.t / 1000);
+      _store.set(key, { time: key, open: c.o, high: c.h, low: c.l, close: c.c, volume: 0 });
+    });
+  }
+
+  /** @returns {OHLCCandle[]} All candles sorted ascending by time */
+  function getAll() {
+    return Array.from(_store.values()).sort((a, b) => a.time - b.time);
+  }
+
+  /** Prune oldest candles, keeping at most `maxLen`. */
+  function trim(maxLen = 600) {
+    if (_store.size <= maxLen) return;
+    const keys = Array.from(_store.keys()).sort((a, b) => a - b);
+    keys.slice(0, _store.size - maxLen).forEach(k => _store.delete(k));
+  }
+
+  function clear() { _store.clear(); }
+
+  return { processTick, seed, getAll, trim, clear };
+})();
+
+// ── FeedManager — Binance WebSocket with auto-reconnect ───────────────────────
+/**
+ * @typedef {'LIVE'|'RECONNECTING'|'STALE'|'DISCONNECTED'} FeedStatus
+ */
+const FeedManager = (() => {
+  const SYMBOLS    = { btc: 'btcusdt', eth: 'ethusdt', sol: 'solusdt' };
+  const WS_BASE    = 'wss://stream.binance.com:9443/ws';
+  const STATUS_CLR = {
+    LIVE:         '#22c55e',
+    RECONNECTING: '#f79e0b',
+    STALE:        '#ef4444',
+    DISCONNECTED: '#475569',
+  };
+
+  let _sym        = 'btc';
+  let _ws         = null;
+  /** @type {FeedStatus} */
+  let _status     = 'DISCONNECTED';
+  let _retryDelay = 1500;
+  let _retryTimer = null;
+  let _staleTimer = null;
+
+  function _setStatus(s) {
+    _status = s;
+    const el = document.getElementById('feed-status');
+    if (el) { el.textContent = s; el.style.color = STATUS_CLR[s] || '#475569'; }
+  }
+
+  function _resetStaleTimer() {
+    clearTimeout(_staleTimer);
+    _staleTimer = setTimeout(() => _setStatus('STALE'), 12000); // 12s no trades = stale
+  }
+
+  function _openWs() {
+    const binanceSym = SYMBOLS[_sym] || 'btcusdt';
+    _setStatus('RECONNECTING');
+    try {
+      _ws = new WebSocket(`${WS_BASE}/${binanceSym}@trade`);
+    } catch (_) { _scheduleRetry(); return; }
+
+    _ws.onopen = () => {
+      _retryDelay = 1500; // reset backoff on success
+      _setStatus('LIVE');
+      _resetStaleTimer();
+    };
+
+    _ws.onmessage = ev => {
+      _resetStaleTimer();
+      if (_status !== 'LIVE') _setStatus('LIVE');
+      try {
+        const tick = JSON.parse(ev.data);
+        if (!tick || tick.e !== 'trade') return;
+        const { candle } = CandleBuilder.processTick(tick);
+        CandleBuilder.trim(600);
+        // Push live update to LightweightCharts (O(1), no full redraw)
+        if (_btcLwChart && _btcLwChart._candleSeries) {
+          _btcLwChart._candleSeries.update(candle);
+        }
+        // Update price badge and ticker
+        const ps = candle.close.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const badge = document.getElementById('btc-badge');
+        if (badge) badge.textContent = `$${ps}`;
+        const tp = document.getElementById('t-btc-price');
+        if (tp && _sym === 'btc') tp.textContent = `$${ps}`;
+      } catch (_) { /* malformed tick */ }
+    };
+
+    _ws.onerror = () => { /* followed by onclose */ };
+
+    _ws.onclose = ev => {
+      clearTimeout(_staleTimer);
+      if (!ev.wasClean || ev.code !== 1000) _scheduleRetry();
+      else _setStatus('DISCONNECTED');
+    };
+  }
+
+  function _scheduleRetry() {
+    _setStatus('RECONNECTING');
+    clearTimeout(_retryTimer);
+    _retryTimer = setTimeout(() => {
+      _retryDelay = Math.min(_retryDelay * 2, 30000);
+      _openWs();
+    }, _retryDelay);
+  }
+
+  function _teardown() {
+    clearTimeout(_retryTimer);
+    clearTimeout(_staleTimer);
+    if (_ws) {
+      _ws.onclose = null; _ws.onerror = null; _ws.onmessage = null;
+      try { _ws.close(1000, 'switching'); } catch (_) {}
+      _ws = null;
+    }
+  }
+
+  async function _seedChart(sym) {
+    try {
+      const symMap = { btc: 'BTC/USDT', eth: 'ETH/USDT', sol: 'SOL/USDT' };
+      const symParam = encodeURIComponent(symMap[sym] || 'BTC/USDT');
+      const r = await fetch(`/api/btc-chart?limit=400&symbol=${symParam}`);
+      if (!r.ok) return;
+      const candles = await r.json();
+      if (candles && candles.length) {
+        CandleBuilder.seed(candles);
+        if (_btcLwChart && _btcLwChart._candleSeries) {
+          _btcLwChart._candleSeries.setData(CandleBuilder.getAll());
+          _btcLwChart.timeScale().fitContent();
+        }
+      }
+    } catch (_) { /* seed errors are non-fatal */ }
+  }
+
+  /** Connect (or reconnect) to the given symbol's WebSocket feed. */
+  function connect(sym) {
+    if (sym) _sym = sym;
+    _teardown();
+    CandleBuilder.clear();
+    _setStatus('RECONNECTING');
+    _seedChart(_sym).then(() => _openWs());
+  }
+
+  /** Switch to a different trading symbol. */
+  function switchSymbol(sym) {
+    if (!SYMBOLS[sym]) return;
+    if (sym === _sym) { showPage('dashboard'); return; }
+    _sym = sym;
+    const label = sym.toUpperCase();
+    const titleEl = document.getElementById('chart-sym-title');
+    if (titleEl) titleEl.innerHTML = `${label} / USD  <span class="ph-sub">1s live</span>`;
+    document.querySelectorAll('.sym-btn').forEach(b => b.classList.toggle('active', b.dataset.sym === sym));
+    const badge = document.getElementById('btc-badge');
+    if (badge) badge.textContent = '—';
+    connect(sym);
+    showPage('dashboard');
+  }
+
+  function reconnect() { connect(); }
+  function getStatus() { return _status; }
+  function getSymbol() { return _sym; }
+
+  return { connect, switchSymbol, reconnect, getStatus, getSymbol };
+})();
 
 // ── Clock & Countdown ─────────────────────────────────────────────────────────
 
@@ -97,13 +323,160 @@ let _cd = 5;
 function tickCd() {
   _cd--;
   if (_cd <= 0) _cd = 5;
-  const s = `${_cd}s`;
-  // countdown element removed in redesign — only update ctrl-refresh
-
   const ctrl = document.getElementById('ctrl-refresh');
-  if (ctrl) ctrl.textContent = s;
+  if (ctrl) ctrl.textContent = `${_cd}s`;
 }
 setInterval(tickCd, 1000);
+
+// ── CommandPalette ─────────────────────────────────────────────────────────────
+const CommandPalette = (() => {
+  /** @type {{ id: string, label: string, keys: string[], action: () => void }[]} */
+  const _cmds = [
+    { id: 'btc',       label: 'Switch chart → BTC',  keys: ['btc','1'],       action: () => FeedManager.switchSymbol('btc') },
+    { id: 'eth',       label: 'Switch chart → ETH',  keys: ['eth','2'],       action: () => FeedManager.switchSymbol('eth') },
+    { id: 'sol',       label: 'Switch chart → SOL',  keys: ['sol','3'],       action: () => FeedManager.switchSymbol('sol') },
+    { id: 'reconnect', label: 'Reconnect live feed', keys: ['reconnect','r'], action: () => FeedManager.reconnect() },
+    { id: 'export',    label: 'Export trades CSV',   keys: ['export','csv'],  action: _exportCsv },
+    { id: 'dash',      label: 'Dashboard',           keys: ['dash','d'],      action: () => showPage('dashboard') },
+    { id: 'pos',       label: 'Positions',           keys: ['pos','p'],       action: () => showPage('positions') },
+    { id: 'trades',    label: 'Trade history',       keys: ['trades','t'],    action: () => showPage('trades') },
+    { id: 'perf',      label: 'Performance',         keys: ['perf','f'],      action: () => showPage('performance') },
+    { id: 'intel',     label: 'Market intelligence', keys: ['intel','i'],     action: () => showPage('sentiment') },
+    { id: 'ctrl',      label: 'System controls',     keys: ['ctrl','c'],      action: () => showPage('controls') },
+  ];
+
+  let _open        = false;
+  let _inputCb     = null;
+  let _keyCb       = null;
+
+  async function _exportCsv() {
+    try {
+      const rows = await apiFetch('/trades?limit=100');
+      if (!rows.length) { alert('No trades to export.'); return; }
+      const cols = ['id','direction','status','market','size_usdc','pnl','entry_price','exit_price','opened_at','resolved_at'];
+      const csv  = [
+        cols.join(','),
+        ...rows.map(t => cols.map(k => {
+          const v = String(t[k] ?? '').replace(/"/g, '""');
+          return v.includes(',') ? `"${v}"` : v;
+        }).join(','))
+      ].join('\n');
+      const a = Object.assign(document.createElement('a'), {
+        href:     URL.createObjectURL(new Blob([csv], { type: 'text/csv' })),
+        download: `polyquant_trades_${new Date().toISOString().slice(0,10)}.csv`,
+      });
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) { alert('Export failed: ' + e.message); }
+  }
+
+  function _render(q) {
+    const list = document.getElementById('cmd-list');
+    if (!list) return;
+    const lq = (q || '').toLowerCase().trim();
+    const filtered = lq
+      ? _cmds.filter(c => c.label.toLowerCase().includes(lq) || c.keys.some(k => k.startsWith(lq)))
+      : _cmds;
+    list.innerHTML = filtered.length
+      ? filtered.map((c, i) =>
+          `<li class="cmd-item${i === 0 ? ' cmd-active' : ''}" data-id="${esc(c.id)}" role="option" aria-selected="${i === 0}">
+            <span class="cmd-item-label">${esc(c.label)}</span>
+            <span class="cmd-item-keys">${c.keys.slice(0,2).map(k => `<kbd>${esc(k)}</kbd>`).join(' ')}</span>
+          </li>`
+        ).join('')
+      : `<li class="cmd-item-empty">No matches for "${esc(q)}"</li>`;
+    list.querySelectorAll('.cmd-item').forEach(li =>
+      li.addEventListener('click', () => _exec(li.dataset.id))
+    );
+  }
+
+  function _exec(id) {
+    const cmd = _cmds.find(c => c.id === id);
+    if (cmd) { close(); setTimeout(cmd.action, 40); }
+  }
+
+  function _moveActive(dir) {
+    const items = [...document.querySelectorAll('.cmd-item')];
+    if (!items.length) return;
+    const cur  = items.findIndex(i => i.classList.contains('cmd-active'));
+    const next = Math.max(0, Math.min(items.length - 1, cur + dir));
+    items.forEach(i => { i.classList.remove('cmd-active'); i.setAttribute('aria-selected','false'); });
+    items[next].classList.add('cmd-active');
+    items[next].setAttribute('aria-selected','true');
+    items[next].scrollIntoView({ block: 'nearest' });
+  }
+
+  function open() {
+    const overlay = document.getElementById('cmd-palette');
+    const input   = document.getElementById('cmd-input');
+    if (!overlay || !input || _open) return;
+    _open = true;
+    overlay.classList.add('visible');
+    overlay.setAttribute('aria-hidden','false');
+    input.value = '';
+    _render('');
+    input.focus();
+    _inputCb = e => _render(e.target.value);
+    _keyCb   = e => {
+      if (e.key === 'Escape')    { close(); return; }
+      if (e.key === 'Enter')     { const a = document.querySelector('.cmd-active'); if (a) _exec(a.dataset.id); return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); _moveActive(1);  return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); _moveActive(-1); }
+    };
+    input.addEventListener('input',   _inputCb);
+    input.addEventListener('keydown', _keyCb);
+  }
+
+  function close() {
+    const overlay = document.getElementById('cmd-palette');
+    const input   = document.getElementById('cmd-input');
+    if (!overlay || !_open) return;
+    _open = false;
+    overlay.classList.remove('visible');
+    overlay.setAttribute('aria-hidden','true');
+    if (input) {
+      if (_inputCb) input.removeEventListener('input',   _inputCb);
+      if (_keyCb)   input.removeEventListener('keydown', _keyCb);
+      _inputCb = _keyCb = null;
+    }
+  }
+
+  function isOpen() { return _open; }
+
+  document.addEventListener('click', e => {
+    if (e.target.id === 'cmd-palette') close();
+  });
+
+  return { open, close, isOpen };
+})();
+
+// ── Keyboard Shortcuts ─────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const tag    = (e.target.tagName || '').toLowerCase();
+  const typing = tag === 'input' || tag === 'textarea' || e.target.isContentEditable;
+
+  if (e.key === 'Escape') { CommandPalette.close(); return; }
+
+  if (e.key === '/' && !typing && !CommandPalette.isOpen()) {
+    e.preventDefault();
+    CommandPalette.open();
+    return;
+  }
+
+  if (typing || CommandPalette.isOpen()) return;
+
+  switch (e.key) {
+    case '1': FeedManager.switchSymbol('btc'); break;
+    case '2': FeedManager.switchSymbol('eth'); break;
+    case '3': FeedManager.switchSymbol('sol'); break;
+    case 'd': case 'D': showPage('dashboard');   break;
+    case 'p': case 'P': showPage('positions');   break;
+    case 't': case 'T': showPage('trades');      break;
+    case 'f': case 'F': showPage('performance'); break;
+    case 'i': case 'I': showPage('sentiment');   break;
+    case 'c': case 'C': showPage('controls');    break;
+  }
+});
 
 // ── setCard helper ────────────────────────────────────────────────────────────
 
@@ -135,8 +508,9 @@ async function refreshTicker() {
         cEl.textContent = `${up ? '+' : ''}${chPct.toFixed(2)}%`;
         cEl.className = `tb-val ${up ? 'up' : 'down'}`;
       }
+      // Only update badge from REST if WebSocket hasn't populated it yet
       const badgeEl = document.getElementById('btc-badge');
-      if (badgeEl) {
+      if (badgeEl && (badgeEl.textContent === '—' || FeedManager.getStatus() !== 'LIVE')) {
         badgeEl.textContent = `$${priceStr}`;
         badgeEl.style.color = chPct != null ? (up ? '#22c55e' : '#ef4444') : '';
       }
@@ -179,13 +553,6 @@ async function refreshCryptoPrices() {
     };
     set('t-eth-price', p.eth);
     set('t-sol-price', p.sol);
-    // Update btc badge if ticker hasn't
-    if (p.btc && p.btc.price != null) {
-      const b = document.getElementById('btc-badge');
-      if (b && b.textContent === '—') {
-        b.textContent = `$${Number(p.btc.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-      }
-    }
   } catch (_e) {}
 }
 
@@ -213,92 +580,124 @@ function applyDashboardData(d) {
   const openEl = document.getElementById('t-open');
   if (openEl) openEl.textContent = s.n_open ?? 0;
 
+  // PnL badge: always use actual total_pnl (not raw cumulative)
+  const pnlBadge = document.getElementById('pnl-badge');
+  if (pnlBadge && pnl != null) {
+    pnlBadge.textContent = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+    pnlBadge.style.color = pnl >= 0 ? '#22c55e' : '#ef4444';
+  }
+
   const items = d.activity || [];
   const el = document.getElementById('activity-feed');
   const cnt = document.getElementById('activity-count');
   if (cnt) cnt.textContent = items.length;
   if (!el) return;
-  if (!items.length) { el.innerHTML = '<div class="empty" role="status">No orders yet. Start the bot to begin trading.</div>'; } else {
-  el.innerHTML = items.map(it => {
-    const d_ = fmtDir(it.direction);
-    const mkt = esc(truncate(it.market || '5m', 18));
-    if (it.type === 'open') {
-      const val = it.to_win != null ? `to win $${Number(it.to_win).toFixed(2)}` : '';
-      return `<div class="act-row act-open"><span class="act-type">OPEN</span><span class="act-dir dir-${d_.toLowerCase()}">${d_}</span><span class="act-mkt">${mkt}</span><span class="act-size">$${Number(it.size_usdc || 0).toFixed(2)}</span>${val ? `<span class="act-val">${val}</span>` : ''}</div>`;
-    }
-    const won = (it.status || '').toLowerCase() === 'won';
-    const pnlCls = (it.pnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
-    const ago = timeAgo(it.resolved_at);
-    return `<div class="act-row act-closed"><span class="act-type act-result ${won ? 'won' : 'lost'}">${won ? 'WON' : 'LOST'}</span><span class="act-dir dir-${d_.toLowerCase()}">${d_}</span><span class="act-mkt">${mkt}</span><span class="act-pnl ${pnlCls}">${fmtDollar(it.pnl)}</span>${ago ? `<span class="act-ago">${ago}</span>` : ''}</div>`;
-  }).join('');
+  if (!items.length) {
+    el.innerHTML = '<div class="empty" role="status">No orders yet. Start the bot to begin trading.</div>';
+  } else {
+    el.innerHTML = items.map(it => {
+      const d_ = fmtDir(it.direction);
+      const mkt = esc(truncate(it.market || '5m', 18));
+      if (it.type === 'open') {
+        const val = it.to_win != null ? `to win $${Number(it.to_win).toFixed(2)}` : '';
+        return `<div class="act-row act-open"><span class="act-type">OPEN</span><span class="act-dir dir-${d_.toLowerCase()}">${d_}</span><span class="act-mkt">${mkt}</span><span class="act-size">$${Number(it.size_usdc || 0).toFixed(2)}</span>${val ? `<span class="act-val">${val}</span>` : ''}</div>`;
+      }
+      const won = (it.status || '').toLowerCase() === 'won';
+      const pnlCls = (it.pnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const ago = timeAgo(it.resolved_at);
+      return `<div class="act-row act-closed"><span class="act-type act-result ${won ? 'won' : 'lost'}">${won ? 'WON' : 'LOST'}</span><span class="act-dir dir-${d_.toLowerCase()}">${d_}</span><span class="act-mkt">${mkt}</span><span class="act-pnl ${pnlCls}">${fmtDollar(it.pnl)}</span>${ago ? `<span class="act-ago">${ago}</span>` : ''}</div>`;
+    }).join('');
   }
 
+  // Dashboard mini positions table — show: # | DIR | PRICE | TO WIN
   const pos = d.positions || [];
   const posBody = document.getElementById('positions-body');
-  // Update both the sidebar count and full-page count
   ['pos-count', 'pos-count-full'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.textContent = pos.length;
   });
 
-  // Mini positions table on dashboard (dash-pos-body)
   const dashPosBody = document.getElementById('dash-pos-body');
   if (dashPosBody) {
     if (!pos.length) {
-      dashPosBody.innerHTML = '<tr><td colspan="5" class="empty">No open positions</td></tr>';
+      dashPosBody.innerHTML = '<tr><td colspan="4" class="empty">No open positions</td></tr>';
     } else {
       dashPosBody.innerHTML = pos.map(p => {
         const d_ = fmtDir(p.direction);
         return `<tr>
           <td>#${p.id}</td>
           <td class="dir-${d_.toLowerCase()}">${d_}</td>
-          <td>$${Number(p.size_usdc ?? 0).toFixed(2)}</td>
           <td>${Number(p.entry_price ?? 0).toFixed(3)}</td>
-          <td>$${Number(p.to_win ?? 0).toFixed(2)}</td>
+          <td class="pnl-pos">$${Number(p.to_win ?? 0).toFixed(2)}</td>
         </tr>`;
       }).join('');
     }
   }
+
+  // Full positions page — ID | DIR | TYPE | MARKET | ENTRY | TO WIN | LINK
   if (posBody) {
-    if (!pos.length) { posBody.innerHTML = '<tr><td colspan="10" class="empty" role="status">No open positions</td></tr>'; } else {
-    posBody.innerHTML = pos.map(p => {
-      const d_ = fmtDir(p.direction);
-      const tok = String(p.token_id || '');
-      const isSim = tok.startsWith('SIM-');
-      const typeK = fmtTypeKey(p.market_type, isSim, p.question);
-      const typeL = fmtTypeLabel(p.market_type, isSim, p.question);
-      const q = esc(truncate(p.question || `Polymarket BTC 5m ${d_}`, 48));
-      const link = safeUrl(p.polymarket_url);
-      const val = p.current_value != null ? `$${Number(p.current_value).toFixed(2)}` : '—';
-      return `<tr><td>#${p.id}</td><td class="dir-${d_.toLowerCase()}">${d_}</td><td><span class="tb-badge tb-${typeK}">${esc(typeL)}</span></td><td title="${esc(p.question || '')}">${q}</td><td>${Number(p.shares ?? 0).toFixed(2)}</td><td>$${Number(p.size_usdc ?? 0).toFixed(2)}</td><td>${Number(p.entry_price ?? 0).toFixed(3)}</td><td>${val}</td><td>$${Number(p.to_win ?? 0).toFixed(2)}</td><td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td></tr>`;
-    }).join('');
+    if (!pos.length) {
+      posBody.innerHTML = '<tr><td colspan="7" class="empty" role="status">No open positions</td></tr>';
+    } else {
+      posBody.innerHTML = pos.map(p => {
+        const d_ = fmtDir(p.direction);
+        const tok    = String(p.token_id || '');
+        const isSim  = tok.startsWith('SIM-');
+        const typeK  = fmtTypeKey(p.market_type, isSim, p.question);
+        const typeL  = fmtTypeLabel(p.market_type, isSim, p.question);
+        const q      = esc(truncate(p.question || `Polymarket BTC 5m ${d_}`, 48));
+        const link   = safeUrl(p.polymarket_url);
+        return `<tr>
+          <td>#${p.id}</td>
+          <td class="dir-${d_.toLowerCase()}">${d_}</td>
+          <td><span class="tb-badge tb-${typeK}">${esc(typeL)}</span></td>
+          <td title="${esc(p.question || '')}">${q}</td>
+          <td>${Number(p.entry_price ?? 0).toFixed(3)}</td>
+          <td class="pnl-pos">$${Number(p.to_win ?? 0).toFixed(2)}</td>
+          <td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td>
+        </tr>`;
+      }).join('');
     }
   }
 
+  // Trades
   const tr = d.trades || [];
   const trBody = document.getElementById('trades-body');
-  const trCnt = document.getElementById('trade-count');
+  const trCnt  = document.getElementById('trade-count');
   if (trCnt) trCnt.textContent = tr.length;
   if (trBody) {
-    if (!tr.length) { trBody.innerHTML = '<tr><td colspan="10" class="empty" role="status">No trades yet. Resolved 5m positions appear here.</td></tr>'; } else {
-    trBody.innerHTML = tr.map(t => {
-      const d_ = fmtDir(t.direction);
-      const isLost = (t.status || '').toLowerCase() === 'lost';
-      const rawPnl = t.pnl ?? 0;
-      const pnl = isLost && rawPnl >= 0 ? -Math.abs(t.size_usdc ?? 0) : rawPnl;
-      const pnlCls = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const tok = String(t.token_id || '');
-      const isSim = tok.startsWith('SIM-');
-      const typeK = fmtTypeKey(t.market_type, isSim, t.question);
-      const typeL = fmtTypeLabel(t.market_type, isSim, t.question);
-      const q = esc(truncate(t.question || `Polymarket BTC 5m ${d_}`, 45));
-      const link = safeUrl(t.polymarket_url);
-      const btcE = t.btc_price_entry ? `$${Number(t.btc_price_entry).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
-      const btcX = t.btc_price_exit ? `$${Number(t.btc_price_exit).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
-      const resultCls = isLost ? 'neg' : 'pos';
-      const resultTxt = isLost ? 'LOST' : 'WON';
-      return `<tr><td>#${t.id}</td><td class="dir-${d_.toLowerCase()}">${d_}</td><td><span class="tb-badge tb-${typeK}">${esc(typeL)}</span></td><td><span class="tb-badge ${resultCls}">${resultTxt}</span></td><td title="${esc(t.question || '')}">${q}</td><td>$${Number(t.size_usdc ?? 0).toFixed(2)}</td><td class="${pnlCls}">${fmtDollar(pnl)}</td><td>${btcE}</td><td>${btcX}</td><td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td></tr>`;
-    }).join('');
+    if (!tr.length) {
+      trBody.innerHTML = '<tr><td colspan="10" class="empty" role="status">No trades yet.</td></tr>';
+    } else {
+      trBody.innerHTML = tr.map(t => {
+        const d_     = fmtDir(t.direction);
+        const isLost = (t.status || '').toLowerCase() === 'lost';
+        const rawPnl = t.pnl ?? 0;
+        const pnl    = isLost && rawPnl >= 0 ? -Math.abs(t.size_usdc ?? 0) : rawPnl;
+        const pnlCls = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        const tok    = String(t.token_id || '');
+        const isSim  = tok.startsWith('SIM-');
+        const typeK  = fmtTypeKey(t.market_type, isSim, t.question);
+        const typeL  = fmtTypeLabel(t.market_type, isSim, t.question);
+        const q      = esc(truncate(t.question || `Polymarket BTC 5m ${d_}`, 45));
+        const link   = safeUrl(t.polymarket_url);
+        const btcE   = t.btc_price_entry ? `$${Number(t.btc_price_entry).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
+        const btcX   = t.btc_price_exit  ? `$${Number(t.btc_price_exit).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
+        const resultCls = isLost ? 'neg' : 'pos';
+        const resultTxt = isLost ? 'LOST' : 'WON';
+        return `<tr>
+          <td>#${t.id}</td>
+          <td class="dir-${d_.toLowerCase()}">${d_}</td>
+          <td><span class="tb-badge tb-${typeK}">${esc(typeL)}</span></td>
+          <td><span class="tb-badge ${resultCls}">${resultTxt}</span></td>
+          <td title="${esc(t.question || '')}">${q}</td>
+          <td>$${Number(t.size_usdc ?? 0).toFixed(2)}</td>
+          <td class="${pnlCls}">${fmtDollar(pnl)}</td>
+          <td>${btcE}</td>
+          <td>${btcX}</td>
+          <td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td>
+        </tr>`;
+      }).join('');
     }
   }
 }
@@ -399,7 +798,6 @@ async function refreshStatus() {
     const pnl = s.total_pnl ?? (total - Number(s.starting_balance || 1000));
     const wr = Number(s.win_rate || 0) * 100;
 
-    // Ticker mode/open
     const modeEl = document.getElementById('t-mode');
     if (modeEl) {
       modeEl.textContent = s.paper_trading !== false ? 'PAPER' : 'LIVE';
@@ -408,66 +806,33 @@ async function refreshStatus() {
     const openEl = document.getElementById('t-open');
     if (openEl) openEl.textContent = s.n_open ?? 0;
 
-    // Kill switch
     const ksEl = document.getElementById('kill-sw');
     if (ksEl) {
       ksEl.textContent = s.kill_switch ? 'TRIGGERED' : 'ARMED';
       ksEl.className = `cv ${s.kill_switch ? 'killed' : 'ok'}`;
     }
 
-    // Trading state (Pause/Resume)
     const paused = s.trading_paused === true;
     const hintEl = document.getElementById('trading-state-hint');
     if (hintEl) hintEl.textContent = paused ? 'Paused' : 'Running';
     const resumeBtn = document.getElementById('btn-resume');
-    const pauseBtn = document.getElementById('btn-pause');
+    const pauseBtn  = document.getElementById('btn-pause');
     if (resumeBtn) { resumeBtn.style.display = paused ? 'block' : 'none'; resumeBtn.disabled = !paused; }
-    if (pauseBtn)  { pauseBtn.style.display = paused ? 'none' : 'block'; pauseBtn.disabled = paused; }
+    if (pauseBtn)  { pauseBtn.style.display  = paused ? 'none' : 'block'; pauseBtn.disabled  = paused; }
 
-    // Metric cards
     const pnlCls = pnl >= 0 ? 'pos' : 'neg';
     const retCls = (s.return_pct || 0) >= 0 ? 'pos' : 'neg';
-
-    setCard('equity',
-      `$${Number(total).toFixed(2)}`,
-      fmtPct(s.return_pct || 0) + ' return',
-      retCls
-    );
-    setCard('avail',
-      `$${Number(s.balance || 0).toFixed(2)}`,
-      'free capital',
-      ''
-    );
-    setCard('locked',
-      `$${Number(s.locked_in_positions || 0).toFixed(2)}`,
-      `${s.n_open ?? 0} active position${(s.n_open ?? 0) !== 1 ? 's' : ''}`,
-      ''
-    );
-    setCard('pnl',
-      fmtDollar(pnl),
-      `vs $${Number(s.starting_balance || 1000).toFixed(0)} start`,
-      pnlCls
-    );
-
+    setCard('equity', `$${Number(total).toFixed(2)}`, fmtPct(s.return_pct || 0) + ' return', retCls);
+    setCard('avail',  `$${Number(s.balance || 0).toFixed(2)}`, 'free capital', '');
+    setCard('locked', `$${Number(s.locked_in_positions || 0).toFixed(2)}`,
+      `${s.n_open ?? 0} active position${(s.n_open ?? 0) !== 1 ? 's' : ''}`, '');
+    setCard('pnl', fmtDollar(pnl), `vs $${Number(s.starting_balance || 1000).toFixed(0)} start`, pnlCls);
     const dailyCls = (s.daily_pnl || 0) >= 0 ? 'pos' : 'neg';
-    setCard('daily',
-      fmtDollar(s.daily_pnl || 0),
-      `${s.trades_today ?? 0} trade${(s.trades_today ?? 0) !== 1 ? 's' : ''} today`,
-      dailyCls
-    );
-
-    setCard('trades',
-      String(s.n_total ?? 0),
-      `${s.n_wins ?? 0}W / ${s.n_losses ?? 0}L`,
-      ''
-    );
-
+    setCard('daily', fmtDollar(s.daily_pnl || 0),
+      `${s.trades_today ?? 0} trade${(s.trades_today ?? 0) !== 1 ? 's' : ''} today`, dailyCls);
+    setCard('trades', String(s.n_total ?? 0), `${s.n_wins ?? 0}W / ${s.n_losses ?? 0}L`, '');
     const wrCls = wr >= 55 ? 'pos' : wr < 40 ? 'neg' : '';
-    setCard('wr',
-      `${wr.toFixed(1)}%`,
-      `${s.n_wins ?? 0} wins`,
-      wrCls
-    );
+    setCard('wr', `${wr.toFixed(1)}%`, `${s.n_wins ?? 0} wins`, wrCls);
 
     return s;
   } catch (e) {
@@ -481,18 +846,13 @@ async function refreshStatus() {
 async function refreshParams() {
   try {
     const p = await apiFetch('/params');
-    const edge = Number(p.min_edge || 0);
+    const edge  = Number(p.min_edge || 0);
     const kelly = Number(p.kelly_fraction || 0);
-    setCard('edge',
-      edge.toFixed(3),
-      `5% per trade | kelly ${kelly.toFixed(2)}`,
-      'accent'
-    );
-    // Controls page params
+    setCard('edge', edge.toFixed(3), `5% per trade | kelly ${kelly.toFixed(2)}`, 'accent');
     const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-    set('ctrl-min-edge', edge.toFixed(4));
-    set('ctrl-kelly', kelly.toFixed(2));
-    set('ctrl-max-pos', '$' + (p.max_position_usdc ?? 50));
+    set('ctrl-min-edge',  edge.toFixed(4));
+    set('ctrl-kelly',     kelly.toFixed(2));
+    set('ctrl-max-pos',   '$' + (p.max_position_usdc ?? 50));
     set('ctrl-max-spread', (Number(p.max_spread || 0.1) * 100).toFixed(0) + '%');
   } catch (_e) {}
 }
@@ -507,11 +867,10 @@ function refreshControls(s, ms) {
     if (cls) el.className = 'csv ' + cls;
   };
   if (s) {
-    const modeStr = s.paper_trading !== false ? 'PAPER' : 'LIVE';
     set('ctrl-market-mode', ms?.notice || (ms?.has_5min ? 'Polymarket 5m' : 'SIM (BTC 5m)'));
     set('ctrl-trading', s.trading_paused ? 'Paused' : 'Running', s.trading_paused ? 'neg' : 'pos');
-    set('ctrl-open', String(s.n_open ?? 0));
-    set('ctrl-kill', s.kill_switch ? 'TRIGGERED' : 'ARMED', s.kill_switch ? 'killed' : 'ok');
+    set('ctrl-open',    String(s.n_open ?? 0));
+    set('ctrl-kill',    s.kill_switch ? 'TRIGGERED' : 'ARMED', s.kill_switch ? 'killed' : 'ok');
   }
   const cdEl = document.getElementById('ctrl-refresh');
   if (cdEl) cdEl.textContent = `${_cd}s`;
@@ -521,7 +880,6 @@ function refreshControls(s, ms) {
 
 async function refreshPerformance() {
   const setAll = (base, val, cls) => {
-    // Populate both dashboard panel (e.g. pv-sharpe) and performance page (pv-sharpe2)
     [base, base + '2'].forEach(id => {
       const el = document.getElementById(id);
       if (el) { el.textContent = val; if (cls) el.className = `pv ${cls}`; }
@@ -537,7 +895,6 @@ async function refreshPerformance() {
     setAll('pv-apnl',   p.avg_pnl  != null ? fmtDollar(p.avg_pnl) : '—', Number(p.avg_pnl) >= 0 ? 'pos' : 'neg');
   } catch (_e) {}
 
-  // Markets notice
   try {
     const ms = await apiFetch('/markets-summary');
     const mkts = ms.notice
@@ -555,35 +912,33 @@ async function refreshPerformance() {
 async function refreshPositions() {
   try {
     const rows = await apiFetch('/positions');
-    const tb  = document.getElementById('positions-body');
-    const cnt = document.getElementById('pos-count');
+    const tb   = document.getElementById('positions-body');
+    const cnt  = document.getElementById('pos-count');
     if (cnt) cnt.textContent = rows.length;
     if (!rows.length) {
-      tb.innerHTML = '<tr><td colspan="10" class="empty">No open positions</td></tr>';
+      if (tb) tb.innerHTML = '<tr><td colspan="7" class="empty">No open positions</td></tr>';
       return;
     }
-    tb.innerHTML = rows.map(p => {
-      const d      = fmtDir(p.direction);
-      const tok    = String(p.token_id || '');
-      const isSim  = tok.startsWith('SIM-');
-      const typeK  = fmtTypeKey(p.market_type, isSim, p.question);
-      const typeL  = fmtTypeLabel(p.market_type, isSim, p.question);
-      const q      = esc(truncate(p.question || `Polymarket BTC 5m ${d}`, 48));
-      const link   = safeUrl(p.polymarket_url);
-      const val    = p.current_value != null ? `$${Number(p.current_value).toFixed(2)}` : '—';
-      return `<tr>
-        <td>#${p.id}</td>
-        <td class="dir-${d.toLowerCase()}">${d}</td>
-        <td><span class="tb-badge tb-${typeK}" title="${esc(typeK)}">${esc(typeL)}</span></td>
-        <td title="${esc(p.question || 'Polymarket BTC 5m ' + d)}">${q}</td>
-        <td>${Number(p.shares ?? 0).toFixed(2)}</td>
-        <td>$${Number(p.size_usdc ?? 0).toFixed(2)}</td>
-        <td>${Number(p.entry_price ?? 0).toFixed(3)}</td>
-        <td>${val}</td>
-        <td>$${Number(p.to_win ?? 0).toFixed(2)}</td>
-        <td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td>
-      </tr>`;
-    }).join('');
+    if (tb) {
+      tb.innerHTML = rows.map(p => {
+        const d_    = fmtDir(p.direction);
+        const tok   = String(p.token_id || '');
+        const isSim = tok.startsWith('SIM-');
+        const typeK = fmtTypeKey(p.market_type, isSim, p.question);
+        const typeL = fmtTypeLabel(p.market_type, isSim, p.question);
+        const q     = esc(truncate(p.question || `Polymarket BTC 5m ${d_}`, 48));
+        const link  = safeUrl(p.polymarket_url);
+        return `<tr>
+          <td>#${p.id}</td>
+          <td class="dir-${d_.toLowerCase()}">${d_}</td>
+          <td><span class="tb-badge tb-${typeK}">${esc(typeL)}</span></td>
+          <td title="${esc(p.question || '')}">${q}</td>
+          <td>${Number(p.entry_price ?? 0).toFixed(3)}</td>
+          <td class="pnl-pos">$${Number(p.to_win ?? 0).toFixed(2)}</td>
+          <td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td>
+        </tr>`;
+      }).join('');
+    }
   } catch (e) { console.error('positions:', e); }
 }
 
@@ -592,43 +947,47 @@ async function refreshPositions() {
 async function refreshTrades() {
   try {
     const rows = await apiFetch('/trades?limit=40');
-    const tb  = document.getElementById('trades-body');
-    const cnt = document.getElementById('trade-count');
+    const tb   = document.getElementById('trades-body');
+    const cnt  = document.getElementById('trade-count');
     if (cnt) cnt.textContent = rows.length;
     if (!rows.length) {
-      tb.innerHTML = '<tr><td colspan="10" class="empty">No closed trades yet</td></tr>';
+      if (tb) tb.innerHTML = '<tr><td colspan="11" class="empty">No closed trades yet</td></tr>';
       return;
     }
-    tb.innerHTML = rows.map(t => {
-      const d      = fmtDir(t.direction);
-      const isLost = (t.status || '').toLowerCase() === 'lost';
-      const rawPnl = t.pnl ?? 0;
-      // Fix: lost trades with pnl >= 0 in DB should show as negative
-      const pnl    = isLost && rawPnl >= 0 ? -Math.abs(t.size_usdc ?? 0) : rawPnl;
-      const pnlCls = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const tok    = String(t.token_id || '');
-      const isSim  = tok.startsWith('SIM-');
-      const typeK  = fmtTypeKey(t.market_type, isSim, t.question);
-      const typeL  = fmtTypeLabel(t.market_type, isSim, t.question);
-      const q      = esc(truncate(t.question || `Polymarket BTC 5m ${d}`, 45));
-      const link   = safeUrl(t.polymarket_url);
-      const btcE   = t.btc_price_entry ? `$${Number(t.btc_price_entry).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
-      const btcX   = t.btc_price_exit  ? `$${Number(t.btc_price_exit).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
-      const resultCls = isLost ? 'neg' : 'pos';
-      const resultTxt = isLost ? 'LOST' : 'WON';
-      return `<tr>
-        <td>#${t.id}</td>
-        <td class="dir-${d.toLowerCase()}">${d}</td>
-        <td><span class="tb-badge tb-${typeK}">${esc(typeL)}</span></td>
-        <td><span class="tb-badge ${resultCls}">${resultTxt}</span></td>
-        <td title="${esc(t.question || 'Polymarket BTC 5m ' + d)}">${q}</td>
-        <td>$${Number(t.size_usdc ?? 0).toFixed(2)}</td>
-        <td class="${pnlCls}">${fmtDollar(pnl)}</td>
-        <td>${btcE}</td>
-        <td>${btcX}</td>
-        <td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td>
-      </tr>`;
-    }).join('');
+    if (tb) {
+      tb.innerHTML = rows.map(t => {
+        const d_        = fmtDir(t.direction);
+        const isLost    = (t.status || '').toLowerCase() === 'lost';
+        const rawPnl    = t.pnl ?? 0;
+        const pnl       = isLost && rawPnl >= 0 ? -Math.abs(t.size_usdc ?? 0) : rawPnl;
+        const pnlCls    = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        const tok       = String(t.token_id || '');
+        const isSim     = tok.startsWith('SIM-');
+        const typeK     = fmtTypeKey(t.market_type, isSim, t.question);
+        const typeL     = fmtTypeLabel(t.market_type, isSim, t.question);
+        const q         = esc(truncate(t.question || `Polymarket BTC 5m ${d_}`, 42));
+        const link      = safeUrl(t.polymarket_url);
+        const btcE      = t.btc_price_entry ? `$${Number(t.btc_price_entry).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
+        const btcX      = t.btc_price_exit  ? `$${Number(t.btc_price_exit).toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—';
+        const resultCls = isLost ? 'neg' : 'pos';
+        const resultTxt = isLost ? 'LOST' : 'WON';
+        const opened    = fmtTs(t.opened_at);
+        const closed    = fmtTs(t.resolved_at);
+        return `<tr>
+          <td class="ts-cell" title="${esc(t.opened_at || '')}">${esc(opened)}</td>
+          <td class="ts-cell" title="${esc(t.resolved_at || '')}">${esc(closed)}</td>
+          <td>#${t.id}</td>
+          <td class="dir-${d_.toLowerCase()}">${d_}</td>
+          <td><span class="tb-badge ${resultCls}">${resultTxt}</span></td>
+          <td title="${esc(t.question || '')}">${q}</td>
+          <td>$${Number(t.size_usdc ?? 0).toFixed(2)}</td>
+          <td class="${pnlCls}">${fmtDollar(pnl)}</td>
+          <td>${btcE}</td>
+          <td>${btcX}</td>
+          <td>${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" class="pm-link">↗</a>` : ''}</td>
+        </tr>`;
+      }).join('');
+    }
   } catch (e) { console.error('trades:', e); }
 }
 
@@ -646,7 +1005,6 @@ async function refreshGrid() {
           const tip = `#${t.id} ${pnl >= 0 ? '+' : '-'}$${Math.abs(pnl).toFixed(2)}`;
           return `<span class="tg-cell ${cls}" title="${esc(tip)}"></span>`;
         }).join('');
-    // Populate both dashboard mini grid and performance page grid
     ['trade-grid', 'trade-grid-perf'].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.innerHTML = html;
@@ -662,11 +1020,8 @@ Chart.defaults.font.size = 9;
 Chart.defaults.animation = { duration: 300 };
 Chart.defaults.transitions = { active: { animation: { duration: 200 } } };
 
-let _pnlChart = null;
-let _btcChart = null;
-
 const CHART_GREEN = '#22c55e';
-const CHART_RED = '#ef4444';
+const CHART_RED   = '#ef4444';
 
 function _chartOpts(yFmt) {
   return {
@@ -702,6 +1057,37 @@ function _chartOpts(yFmt) {
   };
 }
 
+/**
+ * Initialize the LightweightCharts DOM container (idempotent).
+ * Must be called before FeedManager.connect() so the chart exists to receive updates.
+ */
+function initBtcChartDom() {
+  if (_btcLwChart || typeof LightweightCharts === 'undefined') return;
+  const wrap = document.getElementById('btc-chart-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  _btcLwChart = LightweightCharts.createChart(wrap, {
+    layout: { background: { color: 'transparent' }, textColor: '#94a3b8' },
+    grid:   { vertLines: { color: '#1e293b' }, horzLines: { color: '#1e293b' } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#334155', scaleMargins: { top: 0.1, bottom: 0.1 } },
+    timeScale: { borderColor: '#334155', timeVisible: true, secondsVisible: true },
+    handleScroll: true,
+    handleScale:  true,
+    width:  wrap.clientWidth,
+    height: wrap.clientHeight || 260,
+  });
+  const cs = _btcLwChart.addCandlestickSeries({
+    upColor:        '#22c55e', downColor:        '#ef4444',
+    borderUpColor:  '#22c55e', borderDownColor:  '#ef4444',
+    wickUpColor:    '#22c55e', wickDownColor:    '#ef4444',
+  });
+  _btcLwChart._candleSeries = cs;
+  new ResizeObserver(() => {
+    if (_btcLwChart) _btcLwChart.resize(wrap.clientWidth, wrap.clientHeight || 260);
+  }).observe(wrap);
+}
+
 async function refreshPnlChart() {
   try {
     const series = await apiFetch('/pnl-history');
@@ -714,17 +1100,11 @@ async function refreshPnlChart() {
     const diff     = last - starting;
     const up       = diff >= 0;
 
-    const badge = document.getElementById('pnl-badge');
-    if (badge) {
-      badge.textContent = `${diff >= 0 ? '+' : '-'}$${Math.abs(diff).toFixed(2)}`;
-      badge.style.color = up ? CHART_GREEN : CHART_RED;
-    }
-
-    const ctx  = document.getElementById('pnl-chart');
+    const ctx = document.getElementById('pnl-chart');
     if (!ctx) return;
-    const ctx2 = ctx.getContext('2d');
+    const ctx2      = ctx.getContext('2d');
     const lineColor = up ? CHART_GREEN : CHART_RED;
-    const grad = ctx2.createLinearGradient(0, 0, 0, ctx.offsetHeight || 160);
+    const grad      = ctx2.createLinearGradient(0, 0, 0, ctx.offsetHeight || 160);
     grad.addColorStop(0, up ? 'rgba(34,197,94,0.22)' : 'rgba(239,68,68,0.18)');
     grad.addColorStop(1, 'rgba(0,0,0,0)');
 
@@ -743,27 +1123,12 @@ async function refreshPnlChart() {
       data: {
         labels,
         datasets: [
-          {
-            label: 'Equity',
-            data,
-            borderColor: lineColor,
-            backgroundColor: grad,
-            fill: true,
-            tension: 0.3,
-            borderWidth: 2,
-            pointRadius: 0,
-            pointHoverRadius: 3,
-            pointHoverBackgroundColor: lineColor,
-          },
-          {
-            label: 'Baseline',
-            data: data.map(() => starting),
-            borderColor: 'rgba(86,96,112,.45)',
-            borderDash: [3, 3],
-            borderWidth: 1,
-            pointRadius: 0,
-            fill: false,
-          },
+          { label: 'Equity', data, borderColor: lineColor, backgroundColor: grad,
+            fill: true, tension: 0.3, borderWidth: 2, pointRadius: 0, pointHoverRadius: 3,
+            pointHoverBackgroundColor: lineColor },
+          { label: 'Baseline', data: data.map(() => starting),
+            borderColor: 'rgba(86,96,112,.45)', borderDash: [3,3],
+            borderWidth: 1, pointRadius: 0, fill: false },
         ],
       },
       options: {
@@ -772,9 +1137,7 @@ async function refreshPnlChart() {
           ..._chartOpts().plugins,
           tooltip: {
             ..._chartOpts().plugins.tooltip,
-            callbacks: {
-              label: c => `${c.dataset.label}: $${Number(c.raw).toFixed(2)}`,
-            },
+            callbacks: { label: c => `${c.dataset.label}: $${Number(c.raw).toFixed(2)}` },
           },
         },
       },
@@ -782,74 +1145,12 @@ async function refreshPnlChart() {
   } catch (e) { console.error('pnl-chart:', e); }
 }
 
+// refreshBtcChart: called from refreshAll but is a no-op once FeedManager is running.
+// Only runs on the first call to seed the chart before WS connects.
 async function refreshBtcChart() {
-  try {
-    const candles = await apiFetch('/btc-chart?limit=120');
-    if (!candles?.length) return;
-
-    const labels = candles.map((c, i) => {
-      const d = new Date(c.t);
-      return i === 0 ? 'Start' : `${d.getUTCHours()}:${String(d.getUTCMinutes()).padStart(2,'0')}`;
-    });
-    const data = candles.map(c => c.c);
-    const last = data[data.length - 1];
-    const first = data[0];
-    const change = first ? ((last - first) / first) * 100 : 0;
-    const up = change >= 0;
-
-    const badge = document.getElementById('btc-badge');
-    if (badge) {
-      badge.textContent = last != null ? `$${Number(last).toLocaleString(undefined,{minFractionDigits:2,maxFractionDigits:2})}` : '—';
-      badge.style.color = up ? CHART_GREEN : CHART_RED;
-    }
-
-    const ctx = document.getElementById('btc-chart');
-    if (!ctx) return;
-    const ctx2 = ctx.getContext('2d');
-    const lineColor = up ? CHART_GREEN : CHART_RED;
-    const grad = ctx2.createLinearGradient(0, 0, 0, ctx.offsetHeight || 160);
-    grad.addColorStop(0, up ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.15)');
-    grad.addColorStop(1, 'rgba(0,0,0,0)');
-
-    if (_btcChart) {
-      _btcChart.data.labels = labels;
-      _btcChart.data.datasets[0].data = data;
-      _btcChart.data.datasets[0].borderColor = lineColor;
-      _btcChart.data.datasets[0].backgroundColor = grad;
-      _btcChart.update('active');
-      return;
-    }
-    _btcChart = new Chart(ctx2, {
-      type: 'line',
-      data: {
-        labels,
-        datasets: [{
-          label: 'BTC/USD',
-          data,
-          borderColor: lineColor,
-          backgroundColor: grad,
-          fill: true,
-          tension: 0.2,
-          borderWidth: 2,
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          pointHoverBackgroundColor: lineColor,
-        }],
-      },
-      options: {
-        ..._chartOpts(v => `$${Number(v).toLocaleString(undefined,{minFractionDigits:0,maxFractionDigits:0})}`),
-        plugins: {
-          ..._chartOpts().plugins,
-          tooltip: {
-            ..._chartOpts().plugins.tooltip,
-            callbacks: {
-              label: c => `BTC: $${Number(c.raw).toLocaleString(undefined,{minFractionDigits:2,maxFractionDigits:2})}`,
-            },
-          },
-        },
-      },
-    });
-  } catch (e) { console.error('btc-chart:', e); }
+  if (_feedInitialized) { initBtcChartDom(); return; }
+  // This path is taken only if somehow called before _feedInitialized is set.
+  // FeedManager.connect() handles seeding + live updates.
 }
 
 // ── Controls ──────────────────────────────────────────────────────────────────
@@ -881,25 +1182,18 @@ document.getElementById('btn-reset').addEventListener('click', async () => {
 });
 
 document.getElementById('btn-pause').addEventListener('click', async () => {
-  try {
-    await fetch('/api/pause', { method: 'POST' });
-    _cd = 1;
-    await refreshStatus();
-  } catch (e) { console.error(e); }
+  try { await fetch('/api/pause', { method: 'POST' }); _cd = 1; await refreshStatus(); }
+  catch (e) { console.error(e); }
 });
 
 document.getElementById('btn-resume').addEventListener('click', async () => {
-  try {
-    await fetch('/api/resume', { method: 'POST' });
-    _cd = 1;
-    await refreshStatus();
-  } catch (e) { console.error(e); }
+  try { await fetch('/api/resume', { method: 'POST' }); _cd = 1; await refreshStatus(); }
+  catch (e) { console.error(e); }
 });
 
 document.getElementById('btn-find-markets').addEventListener('click', async () => {
   const btn = document.getElementById('btn-find-markets');
-  btn.disabled = true;
-  btn.textContent = '…';
+  btn.disabled = true; btn.textContent = '…';
   try {
     const r = await fetch('/api/find-markets', { method: 'POST' });
     const data = await r.json();
@@ -919,7 +1213,7 @@ document.getElementById('btn-live-check').addEventListener('click', async () => 
   } catch (e) { alert('Live check failed: ' + e.message); }
 });
 
-// ── Page routing (distinct views, no cramping) ─────────────────────────────────
+// ── Page routing ──────────────────────────────────────────────────────────────
 
 let _currentView = 'dashboard';
 
@@ -971,7 +1265,8 @@ async function refreshAll() {
     refreshCryptoPrices(),
     refreshParams(),
     refreshPnlChart(),
-    refreshBtcChart(),
+    // BTC chart: FeedManager handles live updates via WebSocket
+    // refreshBtcChart() intentionally omitted once feed is initialized
   ]);
   refreshGrid();
   refreshPerformance();
@@ -983,13 +1278,27 @@ async function refreshAll() {
   } catch (_e) { refreshControls(d?.status, null); }
 }
 
+// ── Symbol switcher ───────────────────────────────────────────────────────────
+
+document.querySelectorAll('.sym-btn').forEach(btn => {
+  btn.addEventListener('click', () => FeedManager.switchSymbol(btn.dataset.sym));
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+
+// 1. Initialize chart DOM (must be before FeedManager.connect so chart exists)
+initBtcChartDom();
+
+// 2. Start live WebSocket feed (seeds from REST + opens WS)
+FeedManager.connect('btc');
+_feedInitialized = true;
+
+// 3. Initial data fetch + start polling
 refreshAll();
-setInterval(refreshAll, 5000);
-setInterval(() => {
-  refreshDashboard();
-  refreshTicker();
-  refreshCryptoPrices();
-}, 4000);
+setInterval(refreshAll,          8000);  // Full refresh every 8s
+setInterval(refreshDashboard,    2000);  // Positions + activity every 2s (near real-time)
+setInterval(refreshTicker,       5000);  // Price ticker every 5s
+setInterval(refreshCryptoPrices, 15000); // ETH/SOL less frequently
 
 let _rTimer;
 window.addEventListener('resize', () => {

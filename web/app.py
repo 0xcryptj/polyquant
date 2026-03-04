@@ -46,6 +46,9 @@ def create_app(ctx: "RuntimeContext") -> FastAPI:
     return app
 
 
+STATIC_DIR = PROJECT_ROOT / "web" / "static"
+
+
 def _make_app() -> FastAPI:
     a = FastAPI(title="PolyQuant Terminal", version="2.0.0")
     a.add_middleware(
@@ -55,9 +58,8 @@ def _make_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    static_dir = PROJECT_ROOT / "web" / "static"
-    static_dir.mkdir(parents=True, exist_ok=True)
-    a.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    a.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     return a
 
 
@@ -284,7 +286,7 @@ def _shares_from_row(r: dict) -> float:
 @app.get("/", response_class=HTMLResponse)
 async def index():
     """Serve the dashboard."""
-    html_path = static_dir / "index.html"
+    html_path = STATIC_DIR / "index.html"
     if not html_path.exists():
         raise HTTPException(status_code=404, detail="index.html not found")
     return FileResponse(html_path)
@@ -539,24 +541,56 @@ async def api_trades(limit: int = 50):
 
 @app.get("/api/pnl-history")
 async def api_pnl_history():
-    """Get PnL history for charts (cumulative PnL per trade)."""
+    """Equity curve using balance_after snapshots (accurate) or fallback normalization."""
     from paper_trading import persistence as db
     db.init_db()
     closed = db.get_all_closed_trades()
     bal = db.get_balance_full()
     starting = bal["starting_usdc"] if bal else 1000.0
-    cum = starting
+
+    # Current actual equity
+    open_trades = db.get_open_trades()
+    locked = sum(float(t.get("size_usdc") or 0) for t in open_trades)
+    current_equity = (float(bal["usdc"]) if bal else starting) + locked
+
+    # Use balance_after if available (trades resolved after the schema migration)
+    has_balance_after = any(t.get("balance_after") is not None for t in closed)
+
+    if has_balance_after:
+        series = [{"trade": 0, "timestamp": None, "cumulative": starting, "pnl": 0}]
+        for i, t in enumerate(closed):
+            ba = t.get("balance_after")
+            if ba is None:
+                continue
+            series.append({
+                "trade": i + 1,
+                "timestamp": t.get("resolved_at"),
+                "cumulative": float(ba),
+                "pnl": t.get("pnl") or 0,
+            })
+        # Ensure last point reflects current equity (including open positions)
+        series.append({"trade": len(closed) + 1, "timestamp": None, "cumulative": current_equity, "pnl": 0})
+        return series
+
+    # Fallback: normalize the cumulative PnL series to actual equity range
+    # This prevents the $9k display bug caused by high-multiplier Polymarket payouts
+    raw_cum = starting
+    raw_series = []
+    for t in closed:
+        raw_cum += t.get("pnl") or 0
+        raw_series.append((raw_cum, t.get("resolved_at"), t.get("pnl") or 0))
+
+    if not raw_series:
+        return [{"trade": 0, "timestamp": None, "cumulative": current_equity, "pnl": 0}]
+
+    raw_total = raw_series[-1][0]
+    actual_gain = current_equity - starting
+    # Scale each point so the series ends at current_equity
+    scale = actual_gain / (raw_total - starting) if (raw_total - starting) != 0 else 0
     series = [{"trade": 0, "timestamp": None, "cumulative": starting, "pnl": 0}]
-    for i, t in enumerate(closed):
-        pnl = t.get("pnl") or 0
-        cum += pnl
-        ts = t.get("resolved_at")
-        series.append({
-            "trade": i + 1,
-            "timestamp": ts,
-            "cumulative": cum,
-            "pnl": pnl,
-        })
+    for i, (raw, ts, pnl) in enumerate(raw_series):
+        norm = starting + (raw - starting) * scale
+        series.append({"trade": i + 1, "timestamp": ts, "cumulative": round(norm, 2), "pnl": pnl})
     return series
 
 
@@ -723,12 +757,24 @@ async def api_trade_grid():
 
 
 @app.get("/api/btc-chart")
-async def api_btc_chart(limit: int = 120):
-    """Live BTC chart: Coinbase Exchange → ccxt (Binance/Kraken) → CoinGecko (optional key)."""
+async def api_btc_chart(limit: int = 120, symbol: str = "BTC/USDT"):
+    """Live chart: Coinbase Exchange → ccxt (Binance/Kraken) → CoinGecko. Multi-symbol."""
     try:
         n = max(1, min(int(limit), 500))
     except (TypeError, ValueError):
         n = 120
+
+    # Normalize symbol: "BTC/USDT", "ETH/USDT", "SOL/USDT" etc.
+    sym = (symbol or "BTC/USDT").strip().upper()
+    # Accept bare symbols like "BTCUSDT" → "BTC/USDT"
+    if "/" not in sym and len(sym) >= 6:
+        sym = sym[:3] + "/" + sym[3:]
+    is_btc = sym in ("BTC/USDT", "BTC/USD")
+
+    # Map ccxt symbol → Coinbase product ID
+    coinbase_map = {"BTC/USDT": "BTC-USD", "BTC/USD": "BTC-USD",
+                    "ETH/USDT": "ETH-USD", "ETH/USD": "ETH-USD",
+                    "SOL/USDT": "SOL-USD", "SOL/USD": "SOL-USD"}
 
     def _to_candles(df):
         return [
@@ -737,48 +783,49 @@ async def api_btc_chart(limit: int = 120):
             for ts, row in df.tail(n).iterrows()
         ]
 
-    # 1) Coinbase Exchange (public, no geo-block)
-    try:
-        from data.collector_coinbase import fetch_ohlcv as coinbase_fetch
-        df = coinbase_fetch(product_id="BTC-USD", granularity=60, limit=n)
-        if df is not None and not df.empty:
-            return _to_candles(df)
-    except Exception:
-        pass
+    # 1) Coinbase Exchange (public, no geo-block, BTC/ETH/SOL)
+    cb_product = coinbase_map.get(sym)
+    if cb_product:
+        try:
+            from data.collector_coinbase import fetch_ohlcv as coinbase_fetch
+            df = coinbase_fetch(product_id=cb_product, granularity=60, limit=n)
+            if df is not None and not df.empty:
+                return _to_candles(df)
+        except Exception:
+            pass
 
-    # 2) ccxt: Binance or Kraken
+    # 2) ccxt: Binance or Kraken (any symbol)
     try:
         from data.collector_binance import fetch_ohlcv
-        df = fetch_ohlcv(symbol="BTC/USDT", timeframe="1m", limit=n)
+        df = fetch_ohlcv(symbol=sym, timeframe="1m", limit=n)
         if df is not None and not df.empty:
             return _to_candles(df)
     except Exception:
         pass
 
-    # 3) CoinGecko (optional API key from settings)
-    try:
-        from config.settings import settings
-        import httpx
-        base = (settings.coingecko_base_url or "https://api.coingecko.com").rstrip("/")
-        url = f"{base}/api/v3/coins/bitcoin/market_chart"
-        params = {"vs_currency": "usd", "days": "1"}
-        headers = {}
-        if settings.coingecko_api_key:
-            headers["x-cg-demo-api-key"] = settings.coingecko_api_key
-        async with httpx.AsyncClient(timeout=8.0) as c:
-            r = await c.get(url, params=params, headers=headers or None)
-            r.raise_for_status()
-            data = r.json()
-        prices = data.get("prices", [])
-        if not prices:
-            return []
-        out = []
-        for p in prices[-n:]:
-            t, v = p[0], float(p[1])
-            out.append({"t": t, "o": v, "h": v, "l": v, "c": v})
-        return out
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # 3) CoinGecko fallback (BTC only, optional API key from settings)
+    if is_btc:
+        try:
+            from config.settings import settings
+            import httpx
+            base = (settings.coingecko_base_url or "https://api.coingecko.com").rstrip("/")
+            url = f"{base}/api/v3/coins/bitcoin/market_chart"
+            params = {"vs_currency": "usd", "days": "1"}
+            headers = {}
+            if settings.coingecko_api_key:
+                headers["x-cg-demo-api-key"] = settings.coingecko_api_key
+            async with httpx.AsyncClient(timeout=8.0) as c:
+                r = await c.get(url, params=params, headers=headers or None)
+                r.raise_for_status()
+                data = r.json()
+            prices = data.get("prices", [])
+            if prices:
+                return [{"t": p[0], "o": float(p[1]), "h": float(p[1]),
+                         "l": float(p[1]), "c": float(p[1])} for p in prices[-n:]]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    return []
 
 
 # ── Ticker & Performance endpoints ────────────────────────────────────────────

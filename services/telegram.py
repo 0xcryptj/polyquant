@@ -45,13 +45,13 @@ from services.base import BaseService, HealthStatus
 
 log = structlog.get_logger("telegram")
 
-# Reply keyboard (kept for backward compatibility, but inline is primary)
+# Reply keyboard — always visible at the bottom of the chat
 KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📊 Status"),      KeyboardButton("📋 Positions"), KeyboardButton("📈 Trades")],
-        [KeyboardButton("📉 Performance"), KeyboardButton("🌡 Sentiment"),  KeyboardButton("🧠 Learn")],
-        [KeyboardButton("▶️ Resume"),      KeyboardButton("⏸ Pause"),       KeyboardButton("💊 Health")],
-        [KeyboardButton("⚙ Params"),       KeyboardButton("🔧 Markets"),     KeyboardButton("🛑 Kill")],
+        [KeyboardButton("🚀 Start"),       KeyboardButton("▶️ Resume"),      KeyboardButton("⏸ Pause")],
+        [KeyboardButton("📊 Status"),      KeyboardButton("📋 Positions"),   KeyboardButton("📈 Trades")],
+        [KeyboardButton("📉 Performance"), KeyboardButton("🌡 Sentiment"),   KeyboardButton("🧠 Learn")],
+        [KeyboardButton("💊 Health"),      KeyboardButton("🔧 Markets"),     KeyboardButton("🛑 Kill")],
     ],
     resize_keyboard=True,
 )
@@ -221,17 +221,24 @@ class TelegramService(BaseService):
         await asyncio.sleep(3)
         try:
             s = await asyncio.to_thread(self.ctx.engine.get_status)
-            text = (
-                f"🚀 *PolyQuant v{BOT_VERSION} online*\n\n"
-                f"💰 ${s['balance']:.2f}  ·  {s['return_pct']:+.1f}%\n"
-                f"📋 {s['n_total']} trades  ·  {s['n_wins']}W / {s['n_losses']}L\n\n"
-                f"Use the buttons below or /start for the control panel."
-            )
+            # Send startup message with reply keyboard — establishes the persistent bottom keyboard
             await self.app.bot.send_message(
                 chat_id=self._chat_id,
-                text=text,
+                text=(
+                    f"🚀 *PolyQuant v{BOT_VERSION} online*\n\n"
+                    f"💰 ${s['balance']:.2f}  ·  {s['return_pct']:+.1f}%\n"
+                    f"📋 {s['n_total']} trades  ·  {s['n_wins']}W / {s['n_losses']}L\n\n"
+                    f"Tap *🚀 Start* to begin trading or use any button below."
+                ),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_inline_home_keyboard(admin=True),  # Startup assumes admin
+                reply_markup=KEYBOARD,
+            )
+            # Send inline control panel as a second message
+            await self.app.bot.send_message(
+                chat_id=self._chat_id,
+                text=f"🏠 *Control Panel* — v{BOT_VERSION}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_inline_home_keyboard(admin=True),
             )
         except Exception as exc:
             log.warning("startup_notify_failed", error=str(exc))
@@ -360,33 +367,34 @@ class TelegramService(BaseService):
 
     async def _cb_pnl(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         def _compute():
-            s = self.ctx.engine.get_status()
+            s      = self.ctx.engine.get_status()
             closed = db.get_all_closed_trades()
             if not closed:
                 return None, s
-            pnls = [t["pnl"] for t in closed if t["pnl"] is not None]
-            brier = self.ctx.learner._brier_score(closed)
+            pnls   = [t["pnl"] for t in closed if t["pnl"] is not None]
+            brier  = self.ctx.learner._brier_score(closed)
             sharpe = self.ctx.learner._sharpe(pnls)
-            rwr = self.ctx.learner._rolling_win_rate(closed, 20)
+            rwr    = self.ctx.learner._rolling_win_rate(closed, 20)
+            pnl_vals = pnls or [0.0]
+            peak, running, max_dd = s["starting_balance"], s["starting_balance"], 0.0
+            for p in pnls:
+                running += p
+                if running > peak:
+                    peak = running
+                dd = (peak - running) / peak if peak > 0 else 0.0
+                max_dd = max(max_dd, dd)
             return {
-                "closed": len(closed),
-                "brier": brier, "sharpe": sharpe, "rwr": rwr,
+                "closed": len(closed), "brier": brier, "sharpe": sharpe, "rwr": rwr,
                 "avg_pnl": sum(pnls) / len(pnls) if pnls else 0.0,
-                "best": max(pnls) if pnls else 0.0,
-                "worst": min(pnls) if pnls else 0.0,
+                "best":    max(pnl_vals), "worst": min(pnl_vals), "max_dd": max_dd,
             }, s
 
         r, s = await asyncio.to_thread(_compute)
         if r is None:
             text = "No closed trades yet."
         else:
-            text = (
-                f"📈 *Performance*\n\n"
-                f"{r['closed']} trades  ·  {s['n_wins']}W/{s['n_losses']}L  ·  {s['win_rate']:.0%}\n"
-                f"Avg: {r['avg_pnl']:+.2f}  ·  Best: {r['best']:+.2f}  ·  Worst: {r['worst']:.2f}\n"
-                f"Sharpe: {r['sharpe']:.2f}  ·  Brier: {r['brier']:.3f}  ·  Recent: {r['rwr']:.0%}\n\n"
-                f"💰 ${s['balance']:.2f}  ({s['return_pct']:+.1f}%)"
-            )
+            from bot.telegram_bot import _format_pnl_card
+            text = _format_pnl_card(r, s)
         await update.callback_query.edit_message_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
@@ -419,13 +427,18 @@ class TelegramService(BaseService):
         )
 
     async def _cb_webui(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        s = await asyncio.to_thread(self.ctx.engine.get_status)
+        trading = "▶️ RUNNING" if self.ctx.trading_active.is_set() else "⏸ PAUSED"
+        ks = "🔴 triggered" if s["kill_switch"] else "🟢 armed"
         port = settings.web_port
-        url = f"http://localhost:{port}"
         text = (
-            f"🌐 *WebUI*\n\n"
-            f"Dashboard: {url}\n\n"
-            f"Start with: `python app.py`\n"
-            f"(omit `--no-web` for dashboard)"
+            f"🌐 *Live Dashboard Snapshot*\n\n"
+            f"💰 Balance: ${s['balance']:.2f}  ({s['return_pct']:+.1f}%)\n"
+            f"📋 {s['n_total']} trades  ·  {s['n_wins']}W / {s['n_losses']}L  ·  {s['win_rate']:.0%}\n"
+            f"🔒 Open: {s['n_open']}  ·  Kill switch: {ks}\n"
+            f"Status: {trading}\n\n"
+            f"Full dashboard: `http://localhost:{port}`\n"
+            f"_(open on the machine running the bot)_"
         )
         await update.callback_query.edit_message_text(
             text,
@@ -521,8 +534,20 @@ class TelegramService(BaseService):
         )
 
     async def _cmd_start(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Primary entry: show inline control panel."""
+        """Primary entry: resume trading, restore both keyboards."""
         msg = update.message or update.effective_message
+        # Resume trading unless kill switch is active
+        ks = getattr(self.ctx.engine, "kill_switch", None)
+        if ks is None or not ks.is_triggered():
+            self.ctx.trading_active.set()
+            if self.ctx.state_store is not None:
+                self.ctx.state_store.update(enabled=True)
+        # Re-establish the persistent reply keyboard
+        await msg.reply_text(
+            "🚀 Bot active — use the keyboard below or the control panel:",
+            reply_markup=KEYBOARD,
+        )
+        # Show inline control panel
         await msg.reply_text(
             f"🏠 *PolyQuant v{BOT_VERSION}*\n\nSelect an action:",
             parse_mode=ParseMode.MARKDOWN,
@@ -875,6 +900,7 @@ class TelegramService(BaseService):
     ) -> None:
         text    = (update.message.text or "").strip()
         mapping = {
+            "🚀 Start":        self._cmd_start,
             "📊 Status":       self._cmd_status,
             "📋 Positions":    self._cmd_positions,
             "📈 Trades":       self._cmd_trades,

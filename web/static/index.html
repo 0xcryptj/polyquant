@@ -128,21 +128,56 @@
           </div>
         </div>
 
-        <!-- 3-Column Bloomberg Grid -->
+        <!-- 2-Column Trading Terminal Grid -->
         <div class="dash-grid">
 
-          <!-- ── Left Column: BTC chart + mini positions ──────── -->
-          <div class="dash-col">
-            <div class="panel chart-sm" aria-label="BTC price chart">
+          <!-- ── Left Column: Charts (65%) ──────────────────── -->
+          <div class="dash-col charts-col">
+            <!-- BTC candlestick chart — main chart -->
+            <div class="panel chart-main" aria-label="BTC price chart">
               <div class="ph">
-                <span class="ph-title">BTC / USD</span>
-                <span class="ph-badge" id="btc-badge">—</span>
+                <span class="ph-title" id="chart-sym-title">BTC / USD  <span class="ph-sub">1s live</span></span>
+                <div class="chart-ph-right">
+                  <div class="sym-switcher" role="group" aria-label="Symbol">
+                    <button class="sym-btn active" data-sym="btc" title="BTC/USDT  [key 1]">BTC</button>
+                    <button class="sym-btn" data-sym="eth" title="ETH/USDT  [key 2]">ETH</button>
+                    <button class="sym-btn" data-sym="sol" title="SOL/USDT  [key 3]">SOL</button>
+                  </div>
+                  <span class="feed-badge" id="feed-status" title="Live feed status">INIT</span>
+                  <span class="ph-badge" id="btc-badge">—</span>
+                </div>
               </div>
-              <div class="chart-body">
-                <canvas id="btc-chart"></canvas>
+              <div class="chart-body" id="btc-chart-wrap"></div>
+            </div>
+            <!-- Equity + Performance row -->
+            <div class="dash-row-split">
+              <div class="panel chart-sm" aria-label="Equity curve">
+                <div class="ph">
+                  <span class="ph-title">EQUITY</span>
+                  <span class="ph-badge" id="pnl-badge">—</span>
+                </div>
+                <div class="chart-body">
+                  <canvas id="pnl-chart"></canvas>
+                </div>
+              </div>
+              <div class="panel panel-perf-inline" aria-label="Performance metrics">
+                <div class="ph"><span class="ph-title">PERFORMANCE</span></div>
+                <div class="perf-body">
+                  <div class="prow"><span class="pk">SHARPE</span><span class="pv" id="pv-sharpe">—</span></div>
+                  <div class="prow"><span class="pk">BRIER</span><span class="pv" id="pv-brier">—</span></div>
+                  <div class="prow"><span class="pk">MAX DD</span><span class="pv" id="pv-maxdd">—</span></div>
+                  <div class="prow"><span class="pk">AVG EDGE</span><span class="pv" id="pv-edge">—</span></div>
+                  <div class="prow"><span class="pk">AVG P&amp;L</span><span class="pv" id="pv-apnl">—</span></div>
+                  <div class="prow"><span class="pk">MARKETS</span><span class="pv" id="pv-markets">—</span></div>
+                </div>
               </div>
             </div>
-            <div class="panel panel-flex" aria-label="Open positions">
+          </div>
+
+          <!-- ── Right Column: Orders & Positions (35%) ─────── -->
+          <div class="dash-col orders-col">
+            <!-- Open positions -->
+            <div class="panel panel-pos-mini" aria-label="Open positions">
               <div class="ph">
                 <span class="ph-title">POSITIONS</span>
                 <span class="ph-count" id="pos-count">0</span>
@@ -150,18 +185,15 @@
               <div class="tscroll">
                 <table class="mini-tbl">
                   <thead><tr>
-                    <th>#</th><th>DIR</th><th>SIZE</th><th>ENTRY</th><th>TO WIN</th>
+                    <th>#</th><th>DIR</th><th>PRICE</th><th>TO WIN</th>
                   </tr></thead>
                   <tbody id="dash-pos-body">
-                    <tr><td colspan="5" class="empty">No open positions</td></tr>
+                    <tr><td colspan="4" class="empty">No open positions</td></tr>
                   </tbody>
                 </table>
               </div>
             </div>
-          </div>
-
-          <!-- ── Center Column: Activity feed ────────────────── -->
-          <div class="dash-col">
+            <!-- Orders & Outcomes feed — full remaining height -->
             <div class="panel panel-flex" aria-label="Orders and outcomes" role="log">
               <div class="ph">
                 <span class="ph-title">ORDERS &amp; OUTCOMES</span>
@@ -171,32 +203,7 @@
                 <div class="empty" id="activity-placeholder">Loading…</div>
               </div>
             </div>
-          </div>
-
-          <!-- ── Right Column: Equity chart + perf + grid ────── -->
-          <div class="dash-col">
-            <div class="panel chart-sm" aria-label="Equity curve">
-              <div class="ph">
-                <span class="ph-title">EQUITY</span>
-                <span class="ph-badge" id="pnl-badge">—</span>
-              </div>
-              <div class="chart-body">
-                <canvas id="pnl-chart"></canvas>
-              </div>
-            </div>
-            <div class="panel panel-flex" aria-label="Performance metrics">
-              <div class="ph">
-                <span class="ph-title">PERFORMANCE</span>
-              </div>
-              <div class="perf-body">
-                <div class="prow"><span class="pk">SHARPE</span><span class="pv" id="pv-sharpe">—</span></div>
-                <div class="prow"><span class="pk">BRIER</span><span class="pv" id="pv-brier">—</span></div>
-                <div class="prow"><span class="pk">MAX DD</span><span class="pv" id="pv-maxdd">—</span></div>
-                <div class="prow"><span class="pk">AVG EDGE</span><span class="pv" id="pv-edge">—</span></div>
-                <div class="prow"><span class="pk">AVG P&amp;L</span><span class="pv" id="pv-apnl">—</span></div>
-                <div class="prow"><span class="pk">MARKETS</span><span class="pv" id="pv-markets">—</span></div>
-              </div>
-            </div>
+            <!-- Win/loss grid -->
             <div class="panel grid-sm" aria-label="Win/loss grid">
               <div class="ph">
                 <span class="ph-title">WIN / LOSS</span>
@@ -222,10 +229,10 @@
             <table>
               <thead><tr>
                 <th>ID</th><th>DIR</th><th>TYPE</th><th>MARKET</th>
-                <th>SHARES</th><th>SIZE</th><th>ENTRY</th><th>VALUE</th><th>TO WIN</th><th></th>
+                <th>ENTRY</th><th>TO WIN</th><th></th>
               </tr></thead>
               <tbody id="positions-body">
-                <tr><td colspan="10" class="empty">No open positions</td></tr>
+                <tr><td colspan="7" class="empty">No open positions</td></tr>
               </tbody>
             </table>
           </div>
@@ -244,11 +251,11 @@
           <div class="tscroll">
             <table>
               <thead><tr>
-                <th>ID</th><th>DIR</th><th>TYPE</th><th>RESULT</th><th>MARKET</th>
+                <th>OPENED</th><th>CLOSED</th><th>ID</th><th>DIR</th><th>RESULT</th><th>MARKET</th>
                 <th>SIZE</th><th>P&amp;L</th><th>BTC IN</th><th>BTC OUT</th><th></th>
               </tr></thead>
               <tbody id="trades-body">
-                <tr><td colspan="10" class="empty">No closed trades yet</td></tr>
+                <tr><td colspan="11" class="empty">No closed trades yet</td></tr>
               </tbody>
             </table>
           </div>
@@ -379,9 +386,24 @@
     </footer>
 
   </main>
+<!-- ── Command Palette (press / to open) ────────────────────────────────────── -->
+<div class="cmd-palette-overlay" id="cmd-palette" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Command palette">
+  <div class="cmd-palette-box">
+    <div class="cmd-input-row">
+      <span class="cmd-prompt">⌘</span>
+      <input type="text" id="cmd-input" class="cmd-input" autocomplete="off" spellcheck="false" placeholder="Type a command… (Esc to close)" aria-label="Command input">
+    </div>
+    <ul class="cmd-list" id="cmd-list" role="listbox" aria-label="Commands"></ul>
+    <div class="cmd-footer">
+      <span class="cmd-hint"><kbd>↑↓</kbd> navigate · <kbd>↵</kbd> run · <kbd>Esc</kbd> close · <kbd>/</kbd> anywhere to open</span>
+    </div>
+  </div>
+</div>
+
 </div><!-- /#app -->
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="/static/app.js" defer></script>
 </body>
 </html>

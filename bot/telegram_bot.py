@@ -474,7 +474,7 @@ class TelegramBot:
             brier  = self.learner._brier_score(closed)
             sharpe = self.learner._sharpe(pnls)
             rwr    = self.learner._rolling_win_rate(closed, 20)
-            avg_e  = sum(t["edge"] for t in closed) / len(closed)
+            avg_e  = sum(t.get("edge", 0) for t in closed if t.get("edge") is not None) / max(len([t for t in closed if t.get("edge") is not None]), 1)
             avg_p  = sum(pnls) / len(pnls) if pnls else 0.0
             peak, running, max_dd = s["starting_balance"], s["starting_balance"], 0.0
             for pnl in pnls:
@@ -494,17 +494,7 @@ class TelegramBot:
             await update.message.reply_text("No closed trades yet. Trades close after ~5 minutes.")
             return
 
-        text = (
-            f"📈 *Performance Report*\n\n"
-            f"*Trades:* {result['closed']} total  ·  {s['n_wins']} wins / {s['n_losses']} losses\n"
-            f"Win rate: {s['win_rate']:.0%}  ·  Recent (20): {result['rwr']:.0%}\n\n"
-            f"*Total profit:* ${s['total_pnl']:+.2f}\n"
-            f"Avg per trade: ${result['avg_pnl']:+.2f}\n"
-            f"Best: ${result['best']:+.2f}  ·  Worst: ${result['worst']:.2f}\n\n"
-            f"Risk-adjusted score: {result['sharpe']:.2f}\n"
-            f"Max drawdown: {result['max_dd']:.0%}\n\n"
-            f"*Balance:* ${s['balance']:.2f} ({s['return_pct']:+.1f}% return)"
-        )
+        text = _format_pnl_card(result, s)
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
     async def _learn(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -939,5 +929,69 @@ def _composite_label(s: float) -> str:
     if s < 0.60:  return "Neutral ⚖️"
     if s < 0.75:  return "Bullish 📈"
     return "Very Bullish 🚀"
+
+
+def _bar(ratio: float, width: int = 10) -> str:
+    """Build a filled/empty Unicode block bar.  ratio in [0, 1]."""
+    filled = round(max(0.0, min(1.0, ratio)) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _format_pnl_card(result: dict, s: dict) -> str:
+    """
+    Build a rich Telegram PnL card.
+
+    Args:
+        result: performance metrics dict (closed, brier, sharpe, rwr, avg_pnl, best, worst, max_dd)
+        s:      engine status dict (balance, return_pct, total_pnl, n_wins, n_losses, win_rate, …)
+    """
+    total_pnl  = s.get("total_pnl", 0.0)
+    balance    = s.get("balance", 0.0)
+    return_pct = s.get("return_pct", 0.0)
+    n_wins     = s.get("n_wins", 0)
+    n_losses   = s.get("n_losses", 0)
+    n_total    = result.get("closed", 0)
+    win_rate   = s.get("win_rate", 0.0)
+
+    pnl_arrow = "📈" if total_pnl >= 0 else "📉"
+    ret_icon  = "🟢" if return_pct >= 0 else "🔴"
+    pnl_sign  = "+" if total_pnl >= 0 else ""
+
+    # Win/loss bar
+    wr_bar  = _bar(win_rate)
+    rwr     = result.get("rwr", 0.0)
+    rwr_bar = _bar(rwr)
+
+    sharpe  = result.get("sharpe", 0.0)
+    brier   = result.get("brier", 0.25)
+    max_dd  = result.get("max_dd", 0.0)
+    avg_pnl = result.get("avg_pnl", 0.0)
+    best    = result.get("best", 0.0)
+    worst   = result.get("worst", 0.0)
+
+    sharpe_icon = "🟢" if sharpe > 0.5 else "🟡" if sharpe > 0 else "🔴"
+    brier_icon  = "🟢" if brier < 0.20 else "🟡" if brier < 0.25 else "🔴"
+    dd_icon     = "🟢" if max_dd < 0.05 else "🟡" if max_dd < 0.15 else "🔴"
+
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"  {pnl_arrow}  *P & L  REPORT*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{ret_icon} *${balance:,.2f}*   `{pnl_sign}${total_pnl:.2f}`  `({return_pct:+.1f}%)`\n\n"
+        f"*WIN RATE*\n"
+        f"`{wr_bar}` {win_rate:.0%}\n"
+        f"  {n_wins}W / {n_losses}L  ·  {n_total} trades total\n\n"
+        f"*ROLLING* _(last 20)_\n"
+        f"`{rwr_bar}` {rwr:.0%}\n\n"
+        f"*PER TRADE*\n"
+        f"  Avg:    `{avg_pnl:+.2f}`\n"
+        f"  Best:   `+${best:.2f}`\n"
+        f"  Worst:  `${worst:.2f}`\n\n"
+        f"*RISK*\n"
+        f"  Sharpe:  `{sharpe:+.2f}` {sharpe_icon}\n"
+        f"  Max DD:  `{max_dd:.1%}` {dd_icon}\n"
+        f"  Brier:   `{brier:.3f}` {brier_icon}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━"
+    )
 
 
